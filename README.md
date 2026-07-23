@@ -22,6 +22,26 @@ The device `BoardConfig.mk` may include the optional Klee board configuration:
 include vendor/klee/build/board/BoardConfigKlee.mk
 ```
 
+## Inline GKI build
+
+Klee's kernel integration is implemented independently and builds a standard
+GKI-style kernel tree inside the Android invocation. A device enables it by
+setting its source, image, and configuration:
+
+```make
+TARGET_KERNEL_SOURCE := kernel/xiaomi/sm8450
+BOARD_KERNEL_IMAGE_NAME := Image
+TARGET_KERNEL_CONFIG := \
+    gki_defconfig \
+    vendor/waipio_GKI.config \
+    vendor/xiaomi_GKI.config \
+    vendor/$(PRODUCT_DEVICE)_GKI.config
+```
+
+External modules use `TARGET_KERNEL_EXT_MODULE_ROOT` and
+`TARGET_KERNEL_EXT_MODULES`. Generated modules and `modules.list` are staged in
+`$(PRODUCT_OUT)/obj/KLEE_KERNEL_DIST` for the device packaging rules.
+
 After sourcing the Android build environment, Klee accepts the compact lunch
 form requested by the project:
 
@@ -36,7 +56,8 @@ klee_build -j20
 environment to use another Android release configuration.
 
 Klee does not impose a maximum build parallelism. Pass a job count directly to
-override any configured default:
+override any configured default. Inline kernel compilation uses the same
+selected value:
 
 ```bash
 klee_build -j32
