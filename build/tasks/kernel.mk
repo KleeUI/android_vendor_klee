@@ -7,12 +7,21 @@
 ifeq ($(KLEE_BUILD_KERNEL_FROM_SOURCE),true)
 
 KLEE_KERNEL_BUILDER := vendor/klee/build/tools/build_kernel.py
+ifneq ($(KLEE_KERNEL_BUILD_CONFIG),)
+KLEE_KERNEL_CONFIG_INPUTS := \
+    $(KLEE_KERNEL_PLATFORM_PATH)/$(KLEE_KERNEL_BUILD_CONFIG)
+KLEE_KERNEL_SOURCE_INPUTS := \
+    $(KLEE_KERNEL_PLATFORM_PATH)/build/build.sh \
+    $(TARGET_KERNEL_SOURCE)/Makefile \
+    $(KLEE_KERNEL_CONFIG_INPUTS)
+else
 KLEE_KERNEL_CONFIG_INPUTS := $(foreach config,$(TARGET_KERNEL_CONFIG), \
     $(wildcard $(TARGET_KERNEL_SOURCE)/arch/$(KLEE_KERNEL_ARCH)/configs/$(config)))
 KLEE_KERNEL_CONFIG_INPUTS += $(TARGET_KERNEL_CONFIG_EXT)
 KLEE_KERNEL_SOURCE_INPUTS := \
     $(TARGET_KERNEL_SOURCE)/Makefile \
     $(KLEE_KERNEL_CONFIG_INPUTS)
+endif
 
 .PHONY: klee-kernel-force
 klee-kernel-force:
@@ -24,6 +33,12 @@ KLEE_KERNEL_BUILD_ARGUMENTS := \
     --arch $(KLEE_KERNEL_ARCH) \
     --image $(KLEE_KERNEL_IMAGE_NAME)
 
+ifneq ($(KLEE_KERNEL_BUILD_CONFIG),)
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    --platform-root $(KLEE_KERNEL_PLATFORM_PATH) \
+    --build-config $(KLEE_KERNEL_BUILD_CONFIG) \
+    $(foreach flag,$(TARGET_KERNEL_ADDITIONAL_FLAGS),--make-arg $(flag))
+else
 KLEE_KERNEL_BUILD_ARGUMENTS += \
     $(foreach config,$(TARGET_KERNEL_CONFIG),--config $(config)) \
     $(foreach config,$(TARGET_KERNEL_CONFIG_EXT),--config $(config)) \
@@ -38,9 +53,14 @@ endif
 ifeq ($(TARGET_NEEDS_DTBOIMAGE),true)
 KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-target $(KLEE_KERNEL_DTBO_TARGET)
 endif
+endif
 
 $(KLEE_KERNEL_IMAGE): klee-kernel-force $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_SOURCE_INPUTS)
+ifneq ($(KLEE_KERNEL_BUILD_CONFIG),)
+	@echo "Building Klee kernel platform from $(KLEE_KERNEL_BUILD_CONFIG)"
+else
 	@echo "Building Klee kernel from $(TARGET_KERNEL_SOURCE)"
+endif
 	$(hide) KLEE_KERNEL_JOBS="$(KLEE_KERNEL_JOBS)" \
 	    LLVM_AOSP_PREBUILTS_VERSION="$(LLVM_AOSP_PREBUILTS_VERSION)" \
 	    python3 $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_BUILD_ARGUMENTS)
