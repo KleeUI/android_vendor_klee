@@ -7,16 +7,15 @@
 
 function klee_build()
 {
-    local jobs="${KLEE_BUILD_JOBS:-20}"
+    local jobs="${KLEE_BUILD_JOBS:-}"
+    local has_explicit_jobs=
+    local has_goal=
+    local takes_job_value=
 
-    if ! [[ "$jobs" =~ ^[0-9]+$ ]] || [[ "$jobs" -lt 1 ]]; then
+    if [[ -n "$jobs" ]] &&
+            { ! [[ "$jobs" =~ ^[0-9]+$ ]] || [[ "$jobs" -lt 1 ]]; }; then
         echo "KLEE_BUILD_JOBS must be a positive integer" 1>&2
         return 1
-    fi
-
-    if [[ "$jobs" -gt 20 ]]; then
-        echo "Klee limits build parallelism to 20 jobs; using -j20." 1>&2
-        jobs=20
     fi
 
     if [[ -z "$TARGET_PRODUCT" ]]; then
@@ -24,11 +23,42 @@ function klee_build()
         return 1
     fi
 
-    if [[ $# -eq 0 ]]; then
-        set -- droid
+    for argument in "$@"; do
+        if [[ -n "$takes_job_value" ]]; then
+            takes_job_value=
+            continue
+        fi
+
+        case "$argument" in
+            -j|--jobs)
+                has_explicit_jobs=true
+                takes_job_value=true
+                ;;
+            -j*|--jobs=*)
+                has_explicit_jobs=true
+                ;;
+            -*)
+                ;;
+            *)
+                has_goal=true
+                ;;
+        esac
+    done
+
+    if [[ -z "$has_goal" ]]; then
+        set -- "$@" droid
     fi
 
-    m -j"$jobs" "$@"
+    if [[ -n "$jobs" && -z "$has_explicit_jobs" ]]; then
+        set -- -j"$jobs" "$@"
+    fi
+
+    m "$@"
+}
+
+function mka()
+{
+    m "$@"
 }
 
 function klee_lunch()
