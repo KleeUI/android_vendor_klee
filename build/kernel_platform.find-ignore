@@ -1,0 +1,4 @@
+Klee builds kernel_platform through the standalone Qualcomm kernel build.
+The Android source finder uses the copied .find-ignore marker to keep the
+kernel platform's private Android.bp and Android.mk files out of the platform
+Soong and Kati module graph.
