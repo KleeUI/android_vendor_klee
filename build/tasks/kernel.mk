@@ -9,11 +9,15 @@ ifeq ($(KLEE_BUILD_KERNEL_FROM_SOURCE),true)
 KLEE_KERNEL_BUILDER := vendor/klee/build/tools/build_kernel.py
 ifneq ($(KLEE_KERNEL_BUILD_CONFIG),)
 KLEE_KERNEL_CONFIG_INPUTS := \
-    $(KLEE_KERNEL_PLATFORM_PATH)/$(KLEE_KERNEL_BUILD_CONFIG)
+    $(KLEE_KERNEL_PLATFORM_PATH)/$(KLEE_KERNEL_BUILD_CONFIG) \
+    $(wildcard $(KLEE_KERNEL_PLATFORM_PATH)/common/build.config*)
 KLEE_KERNEL_SOURCE_INPUTS := \
-    $(KLEE_KERNEL_PLATFORM_PATH)/build/build.sh \
-    $(TARGET_KERNEL_SOURCE)/Makefile \
-    $(KLEE_KERNEL_CONFIG_INPUTS)
+    $(sort \
+        $(shell find $(TARGET_KERNEL_SOURCE) -type f \
+            -not -path '*/.git/*' 2>/dev/null) \
+        $(shell find $(KLEE_KERNEL_PLATFORM_PATH)/build -type f \
+            -not -path '*/.git/*' 2>/dev/null) \
+        $(KLEE_KERNEL_CONFIG_INPUTS))
 else
 KLEE_KERNEL_CONFIG_INPUTS := $(foreach config,$(TARGET_KERNEL_CONFIG), \
     $(wildcard $(TARGET_KERNEL_SOURCE)/arch/$(KLEE_KERNEL_ARCH)/configs/$(config)))
@@ -22,9 +26,6 @@ KLEE_KERNEL_SOURCE_INPUTS := \
     $(TARGET_KERNEL_SOURCE)/Makefile \
     $(KLEE_KERNEL_CONFIG_INPUTS)
 endif
-
-.PHONY: klee-kernel-force
-klee-kernel-force:
 
 KLEE_KERNEL_BUILD_ARGUMENTS := \
     --source $(TARGET_KERNEL_SOURCE) \
@@ -55,7 +56,7 @@ KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-target $(KLEE_KERNEL_DTBO_TARGET)
 endif
 endif
 
-$(KLEE_KERNEL_IMAGE): klee-kernel-force $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_SOURCE_INPUTS)
+$(KLEE_KERNEL_IMAGE): $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_SOURCE_INPUTS)
 ifneq ($(KLEE_KERNEL_BUILD_CONFIG),)
 	@echo "Building Klee kernel platform from $(KLEE_KERNEL_BUILD_CONFIG)"
 else
