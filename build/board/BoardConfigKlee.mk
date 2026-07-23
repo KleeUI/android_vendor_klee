@@ -11,4 +11,6 @@ KLEE_BOARD_CONFIG_INCLUDED := true
 # private keys in the public platform repository.
 -include vendor/klee/keys/BoardConfig.mk
 
+include vendor/klee/build/kernel/BoardConfigKernel.mk
+
 endif

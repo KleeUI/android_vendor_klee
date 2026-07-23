@@ -8,6 +8,7 @@
 function klee_build()
 {
     local jobs="${KLEE_BUILD_JOBS:-}"
+    local selected_jobs="$jobs"
     local has_explicit_jobs=
     local has_goal=
     local takes_job_value=
@@ -25,6 +26,7 @@ function klee_build()
 
     for argument in "$@"; do
         if [[ -n "$takes_job_value" ]]; then
+            selected_jobs="$argument"
             takes_job_value=
             continue
         fi
@@ -32,10 +34,16 @@ function klee_build()
         case "$argument" in
             -j|--jobs)
                 has_explicit_jobs=true
+                selected_jobs=
                 takes_job_value=true
                 ;;
-            -j*|--jobs=*)
+            -j*)
                 has_explicit_jobs=true
+                selected_jobs="${argument#-j}"
+                ;;
+            --jobs=*)
+                has_explicit_jobs=true
+                selected_jobs="${argument#--jobs=}"
                 ;;
             -*)
                 ;;
@@ -45,6 +53,13 @@ function klee_build()
         esac
     done
 
+    if [[ -n "$selected_jobs" ]] &&
+            { ! [[ "$selected_jobs" =~ ^[0-9]+$ ]] ||
+                [[ "$selected_jobs" -lt 1 ]]; }; then
+        echo "Build jobs must be a positive integer" 1>&2
+        return 1
+    fi
+
     if [[ -z "$has_goal" ]]; then
         set -- "$@" droid
     fi
@@ -53,12 +68,12 @@ function klee_build()
         set -- -j"$jobs" "$@"
     fi
 
-    m "$@"
+    KLEE_KERNEL_JOBS="$selected_jobs" m "$@"
 }
 
 function mka()
 {
-    m "$@"
+    klee_build "$@"
 }
 
 function klee_lunch()
