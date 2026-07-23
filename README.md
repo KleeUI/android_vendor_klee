@@ -28,11 +28,29 @@ form requested by the project:
 ```bash
 source build/envsetup.sh
 lunch cupid_userdebug
-klee_build
+klee_build -j20
 ```
 
 `lunch cupid_userdebug` is equivalent to selecting product `cupid`, release
 `cp2a`, and variant `userdebug`. Set `KLEE_DEFAULT_RELEASE` before sourcing the
 environment to use another Android release configuration.
 
-`klee_build` defaults to 20 jobs and never exceeds 20 jobs.
+Klee does not impose a maximum build parallelism. Pass a job count directly to
+override any configured default:
+
+```bash
+klee_build -j32
+mka bacon -j32
+```
+
+Set `KLEE_BUILD_JOBS` to provide a machine-specific default when the command
+does not contain `-j` or `--jobs`. An explicit command-line value always wins:
+
+```bash
+export KLEE_BUILD_JOBS=20
+klee_build
+```
+
+If neither form supplies a job count, the Android build system chooses its own
+parallelism. `klee_build` uses `droid` when no build goal is specified, while
+`bacon` is a convenient alias for the complete `droid` build target.
