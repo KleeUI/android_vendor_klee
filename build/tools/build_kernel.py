@@ -23,6 +23,8 @@ def parse_args():
     parser.add_argument("--config", action="append", default=[])
     parser.add_argument("--make-arg", action="append", default=[])
     parser.add_argument("--dtbo-target")
+    parser.add_argument("--platform-root", type=pathlib.Path)
+    parser.add_argument("--build-config")
     parser.add_argument("--external-module-root", type=pathlib.Path)
     parser.add_argument("--external-module", action="append", default=[])
     return parser.parse_args()
@@ -104,6 +106,52 @@ def install_external_modules(args, make, env):
         )
 
 
+def build_kernel_platform(args, jobs, env):
+    if not args.platform_root or not args.build_config:
+        raise RuntimeError(
+            "--platform-root and --build-config must be specified together"
+        )
+
+    platform = args.platform_root.resolve()
+    build_config = pathlib.Path(args.build_config)
+    if build_config.is_absolute():
+        try:
+            build_config = build_config.relative_to(platform)
+        except ValueError as error:
+            raise ValueError("build config must be inside the kernel platform") from error
+
+    config_path = platform / build_config
+    build_script = platform / "build" / "build.sh"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"kernel platform config not found: {config_path}")
+    if not build_script.is_file():
+        raise FileNotFoundError(f"kernel platform builder not found: {build_script}")
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    args.dist.mkdir(parents=True, exist_ok=True)
+    platform_env = env.copy()
+    platform_env["BUILD_CONFIG"] = build_config.as_posix()
+    platform_env["OUT_DIR"] = str(args.out)
+    platform_env["DIST_DIR"] = str(args.dist)
+    run(
+        [str(build_script), f"-j{jobs}", *args.make_arg],
+        platform_env,
+        cwd=platform,
+    )
+
+    required = [
+        args.dist / args.image,
+        args.dist / ".config",
+        args.dist / "Module.symvers",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "kernel platform did not produce a complete KERNEL_KIT: "
+            + ", ".join(missing)
+        )
+
+
 def main():
     args = parse_args()
     top = pathlib.Path.cwd().resolve()
@@ -112,6 +160,8 @@ def main():
     args.dist = args.dist.resolve()
     if args.external_module_root:
         args.external_module_root = args.external_module_root.resolve()
+    if args.platform_root:
+        args.platform_root = args.platform_root.resolve()
 
     jobs = os.environ.get("KLEE_KERNEL_JOBS") or str(os.cpu_count() or 1)
     if not jobs.isdigit() or int(jobs) < 1:
@@ -141,6 +191,15 @@ def main():
     env["LD_LIBRARY_PATH"] = os.pathsep.join(
         [str(clang / "lib64"), env.get("LD_LIBRARY_PATH", "")]
     )
+
+    if args.platform_root or args.build_config:
+        if args.config or args.external_module or args.dtbo_target:
+            raise ValueError(
+                "kernel platform builds cannot use conventional config, module, "
+                "or DTBO arguments"
+            )
+        build_kernel_platform(args, jobs, env)
+        return
 
     args.out.mkdir(parents=True, exist_ok=True)
     args.dist.mkdir(parents=True, exist_ok=True)
