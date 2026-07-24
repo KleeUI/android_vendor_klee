@@ -39,6 +39,9 @@ KLEE_KERNEL_BUILD_ARGUMENTS += \
     --platform-root $(KLEE_KERNEL_PLATFORM_PATH) \
     --build-config $(KLEE_KERNEL_BUILD_CONFIG) \
     $(foreach flag,$(TARGET_KERNEL_ADDITIONAL_FLAGS),--make-arg $(flag))
+ifeq ($(KLEE_KERNEL_SKIP_PLATFORM_DTBO),true)
+KLEE_KERNEL_BUILD_ARGUMENTS += --skip-platform-dtbo
+endif
 else
 KLEE_KERNEL_BUILD_ARGUMENTS += \
     $(foreach config,$(TARGET_KERNEL_CONFIG),--config $(config)) \
@@ -66,7 +69,13 @@ endif
 	    LLVM_AOSP_PREBUILTS_VERSION="$(LLVM_AOSP_PREBUILTS_VERSION)" \
 	    python3 $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_BUILD_ARGUMENTS)
 
-ifneq ($(strip $(BOARD_PREBUILT_DTBOIMAGE)),)
+ifneq ($(strip $(INSTALLED_KERNEL_TARGET)),)
+$(INSTALLED_KERNEL_TARGET): $(KLEE_KERNEL_IMAGE)
+	@echo "Installing Klee kernel image: $@"
+	$(copy-file-to-target)
+endif
+
+ifeq ($(BOARD_PREBUILT_DTBOIMAGE),$(KLEE_KERNEL_DTBO_IMAGE))
 $(BOARD_PREBUILT_DTBOIMAGE): $(KLEE_KERNEL_IMAGE)
 	@test -f "$@" || { echo "Missing generated DTBO image: $@"; exit 1; }
 endif

@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument("--dtbo-target")
     parser.add_argument("--platform-root", type=pathlib.Path)
     parser.add_argument("--build-config")
+    parser.add_argument("--skip-platform-dtbo", action="store_true")
     parser.add_argument("--external-module-root", type=pathlib.Path)
     parser.add_argument("--external-module", action="append", default=[])
     return parser.parse_args()
@@ -33,6 +34,19 @@ def parse_args():
 def run(command, env, cwd=None):
     print("+", " ".join(str(item) for item in command), flush=True)
     subprocess.run(command, cwd=cwd, env=env, check=True)
+
+
+def inherited_kernel_path(top, value):
+    """Return the host PATH without Android's restricted-tool interposer."""
+    android_interposer = (top / "out" / ".path").resolve()
+    entries = []
+    for entry in value.split(os.pathsep):
+        if not entry:
+            continue
+        if pathlib.Path(entry).resolve() == android_interposer:
+            continue
+        entries.append(entry)
+    return entries
 
 
 def resolve_config(source, arch, value):
@@ -133,6 +147,17 @@ def build_kernel_platform(args, jobs, env):
     platform_env["BUILD_CONFIG"] = build_config.as_posix()
     platform_env["OUT_DIR"] = str(args.out)
     platform_env["DIST_DIR"] = str(args.dist)
+    if args.skip_platform_dtbo:
+        platform_env["DT_OVERLAY_SUPPORT"] = "0"
+        # Public Qualcomm kernel releases can omit the retail board DT
+        # repositories. In that configuration Android supplies the matching
+        # stock DTB/DTBO inputs and owns vendor_boot assembly, so the kernel
+        # platform build must stop after producing its kernel kit.
+        platform_env["SKIP_VENDOR_BOOT"] = "1"
+    host_tools = platform_env.get("ADDITIONAL_HOST_TOOLS", "").split()
+    if "printf" not in host_tools:
+        host_tools.append("printf")
+    platform_env["ADDITIONAL_HOST_TOOLS"] = " ".join(host_tools)
     run(
         [str(build_script), f"-j{jobs}", *args.make_arg],
         platform_env,
@@ -185,7 +210,8 @@ def main():
             str(clang / "bin"),
             str(build_tools),
             str(kernel_tools),
-            env.get("PATH", ""),
+            *os.defpath.split(os.pathsep),
+            *inherited_kernel_path(top, env.get("PATH", "")),
         ]
     )
     env["LD_LIBRARY_PATH"] = os.pathsep.join(
