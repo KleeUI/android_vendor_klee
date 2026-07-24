@@ -35,6 +35,7 @@ KLEE_KERNEL_BUILD_ARGUMENTS := \
     --image $(KLEE_KERNEL_IMAGE_NAME)
 
 ifneq ($(KLEE_KERNEL_BUILD_CONFIG),)
+KLEE_KERNEL_UAPI_SOURCE := $(KLEE_KERNEL_OUT)/kernel_uapi_headers/usr
 KLEE_KERNEL_BUILD_ARGUMENTS += \
     --platform-root $(KLEE_KERNEL_PLATFORM_PATH) \
     --build-config $(KLEE_KERNEL_BUILD_CONFIG) \
@@ -43,6 +44,7 @@ ifeq ($(KLEE_KERNEL_SKIP_PLATFORM_DTBO),true)
 KLEE_KERNEL_BUILD_ARGUMENTS += --skip-platform-dtbo
 endif
 else
+KLEE_KERNEL_UAPI_SOURCE := $(KLEE_KERNEL_OUT)/usr
 KLEE_KERNEL_BUILD_ARGUMENTS += \
     $(foreach config,$(TARGET_KERNEL_CONFIG),--config $(config)) \
     $(foreach config,$(TARGET_KERNEL_CONFIG_EXT),--config $(config)) \
@@ -68,6 +70,17 @@ endif
 	$(hide) KLEE_KERNEL_JOBS="$(KLEE_KERNEL_JOBS)" \
 	    LLVM_AOSP_PREBUILTS_VERSION="$(LLVM_AOSP_PREBUILTS_VERSION)" \
 	    python3 $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_BUILD_ARGUMENTS)
+
+KLEE_LEGACY_KERNEL_UAPI := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
+$(KLEE_LEGACY_KERNEL_UAPI): $(KLEE_KERNEL_IMAGE)
+	@echo "Installing Klee kernel UAPI headers: $@"
+	@test -d "$(KLEE_KERNEL_UAPI_SOURCE)" || { \
+	    echo "Missing generated kernel UAPI headers: $(KLEE_KERNEL_UAPI_SOURCE)"; \
+	    exit 1; \
+	}
+	$(hide) rm -rf "$@"
+	$(hide) mkdir -p "$(dir $@)"
+	$(hide) cp -a "$(KLEE_KERNEL_UAPI_SOURCE)" "$@"
 
 ifneq ($(strip $(INSTALLED_KERNEL_TARGET)),)
 $(INSTALLED_KERNEL_TARGET): $(KLEE_KERNEL_IMAGE)
