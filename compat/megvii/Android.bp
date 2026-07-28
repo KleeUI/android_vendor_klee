@@ -1,0 +1,19 @@
+// Copyright (C) 2026 The Klee Project
+// SPDX-License-Identifier: Apache-2.0
+
+cc_defaults {
+    name: "klee_megvii_compat_defaults",
+    srcs: ["MegviiCompat.c"],
+    compile_multilib: "64",
+    vendor: true,
+}
+
+cc_library_shared {
+    name: "libmegface",
+    defaults: ["klee_megvii_compat_defaults"],
+}
+
+cc_library_shared {
+    name: "libMegviiFacepp-0.5.2",
+    defaults: ["klee_megvii_compat_defaults"],
+}
