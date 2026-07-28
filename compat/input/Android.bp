@@ -1,0 +1,14 @@
+// Copyright (C) 2026 The Klee Project
+// SPDX-License-Identifier: Apache-2.0
+
+cc_library_shared {
+    name: "libinput_shim",
+    srcs: ["MotionEventCompat.cpp"],
+    include_dirs: [
+        "frameworks/native/include",
+        "frameworks/native/libs/ui/include",
+    ],
+    shared_libs: ["libinput"],
+    compile_multilib: "64",
+    system_ext_specific: true,
+}
