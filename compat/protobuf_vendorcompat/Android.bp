@@ -1,0 +1,56 @@
+package {
+    default_applicable_licenses: ["klee_protobuf_vendorcompat_license"],
+}
+
+license {
+    name: "klee_protobuf_vendorcompat_license",
+    license_kinds: ["SPDX-license-identifier-BSD"],
+    license_text: ["LICENSE"],
+}
+
+// Qualcomm vendor components built against the protobuf 3.9.1 SONAME.
+// Keep these prebuilts in the Klee compatibility layer so the generic AOSP
+// prebuilts/misc project remains an unmodified upstream project.
+cc_prebuilt_library_shared {
+    name: "libprotobuf-cpp-full-3.9.1-vendorcompat",
+    stem: "libprotobuf-cpp-full-3.9.1",
+    vendor: true,
+    target: {
+        android_arm64: {
+            srcs: ["arm64/libprotobuf-cpp-full-3.9.1.so"],
+        },
+        android_arm: {
+            srcs: ["arm/libprotobuf-cpp-full-3.9.1.so"],
+        },
+    },
+    shared_libs: [
+        "libc++",
+        "libc",
+        "libdl",
+        "liblog",
+        "libm",
+        "libz",
+    ],
+}
+
+cc_prebuilt_library_shared {
+    name: "libprotobuf-cpp-lite-3.9.1-vendorcompat",
+    stem: "libprotobuf-cpp-lite-3.9.1",
+    vendor: true,
+    target: {
+        android_arm64: {
+            srcs: ["arm64/libprotobuf-cpp-lite-3.9.1.so"],
+        },
+        android_arm: {
+            srcs: ["arm/libprotobuf-cpp-lite-3.9.1.so"],
+        },
+    },
+    shared_libs: [
+        "libc++",
+        "libc",
+        "libdl",
+        "liblog",
+        "libm",
+        "libz",
+    ],
+}
