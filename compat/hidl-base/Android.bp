@@ -1,0 +1,14 @@
+// Copyright (C) 2026 The Klee Project
+// SPDX-License-Identifier: Apache-2.0
+
+// The HIDL base implementation lives in libhidlbase on Android 17. This
+// compatibility library preserves the former SONAME required by older clients.
+cc_library_shared {
+    name: "android.hidl.base@1.0",
+    srcs: ["HidlBaseCompat.cpp"],
+    shared_libs: ["libhidlbase"],
+    vendor_available: true,
+    product_available: true,
+    recovery_available: true,
+    double_loadable: true,
+}
