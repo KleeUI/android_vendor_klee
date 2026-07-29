@@ -71,6 +71,14 @@ endif
 	    LLVM_AOSP_PREBUILTS_VERSION="$(LLVM_AOSP_PREBUILTS_VERSION)" \
 	    python3 $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_BUILD_ARGUMENTS)
 
+# Qualcomm's build/build.sh publishes kernel modules beside the image as
+# side effects. Register those files as make targets so image packaging can
+# depend on a clean kernel dist directory without requiring a second build.
+ifneq ($(strip $(KLEE_KERNEL_MODULE_PATHS)),)
+$(KLEE_KERNEL_MODULE_PATHS): $(KLEE_KERNEL_IMAGE)
+	@test -f "$@" || { echo "Missing generated kernel module: $@"; exit 1; }
+endif
+
 KLEE_LEGACY_KERNEL_UAPI := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
 $(KLEE_LEGACY_KERNEL_UAPI): $(KLEE_KERNEL_IMAGE)
 	@echo "Installing Klee kernel UAPI headers: $@"
