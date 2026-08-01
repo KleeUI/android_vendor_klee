@@ -9,8 +9,10 @@
 import argparse
 import os
 import pathlib
+import re
 import shutil
 import subprocess
+import sys
 
 
 def parse_args():
@@ -26,6 +28,9 @@ def parse_args():
     parser.add_argument("--platform-root", type=pathlib.Path)
     parser.add_argument("--build-config")
     parser.add_argument("--skip-platform-dtbo", action="store_true")
+    parser.add_argument("--dtb-base", action="append", default=[])
+    parser.add_argument("--dtb-overlay", action="append", default=[])
+    parser.add_argument("--dtb-output", type=pathlib.Path)
     parser.add_argument("--external-module-root", type=pathlib.Path)
     parser.add_argument("--external-module", action="append", default=[])
     return parser.parse_args()
@@ -47,6 +52,59 @@ def inherited_kernel_path(top, value):
             continue
         entries.append(entry)
     return entries
+
+
+def resolve_clang_prebuilt(top):
+    """Locate the compiler selected by this Android checkout."""
+    clang_root = top / "prebuilts" / "clang" / "host" / "linux-x86"
+    requested = os.environ.get("LLVM_AOSP_PREBUILTS_VERSION")
+    if requested:
+        candidate = clang_root / requested
+        if (candidate / "bin" / "clang").is_file():
+            return candidate
+        raise FileNotFoundError(
+            "requested Android clang prebuilt is unusable: " + str(candidate)
+        )
+
+    # Keep the kernel compiler aligned with the platform compiler instead of
+    # assuming that the lightweight clang-stable utility directory is a full
+    # toolchain.  This also makes a fresh checkout work without an envsetup
+    # shell exporting LLVM_AOSP_PREBUILTS_VERSION.
+    global_go = top / "build" / "soong" / "cc" / "config" / "global.go"
+    if global_go.is_file():
+        match = re.search(
+            r'ClangDefaultVersion\s*=\s*"([^"]+)"',
+            global_go.read_text(encoding="utf-8"),
+        )
+        if match:
+            candidate = clang_root / match.group(1)
+            if (candidate / "bin" / "clang").is_file():
+                return candidate
+
+    candidates = sorted(
+        path
+        for path in clang_root.glob("clang-*")
+        if (path / "bin" / "clang").is_file()
+    )
+    if not candidates:
+        raise FileNotFoundError("no usable Android clang prebuilt under " + str(clang_root))
+    return candidates[-1]
+
+
+def create_host_tool_shims(out):
+    """Provide legacy host-tool names expected by Qualcomm's 5.10 scripts."""
+    shim_dir = out / ".klee-host-tools"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    python_shim = shim_dir / "python"
+    python_target = pathlib.Path(sys.executable).resolve()
+    if python_shim.is_symlink():
+        if python_shim.resolve() != python_target:
+            python_shim.unlink()
+    elif python_shim.exists():
+        raise FileExistsError("host-tool shim is not a symlink: " + str(python_shim))
+    if not python_shim.exists():
+        python_shim.symlink_to(python_target)
+    return shim_dir
 
 
 def resolve_config(source, arch, value):
@@ -91,24 +149,43 @@ def configure_kernel(args, make, base_command, env):
         run(base_command + ["olddefconfig"], env)
 
 
-def install_external_modules(args, make, env):
+def install_external_modules(args, make, jobs, env):
     if not args.external_module:
         return
     if not args.external_module_root:
         raise RuntimeError("external modules require --external-module-root")
 
+    module_root_relative_to_kernel = pathlib.PurePosixPath(
+        os.path.relpath(args.external_module_root, args.source)
+    )
+
     for relative in args.external_module:
         module = (args.external_module_root / relative).resolve()
+        if not module.is_dir():
+            raise FileNotFoundError(f"external module directory not found: {module}")
+
+        # Qualcomm's module wrappers derive their source path from M. M must
+        # remain relative to the kernel tree; an absolute value would turn
+        # expressions such as $(KERNEL_SRC)/$(M) into an invalid path.
+        module_kernel_path = module_root_relative_to_kernel / relative
         command = [
             str(make),
+            f"-j{jobs}",
             "-C",
             str(module),
+            f"M={module_kernel_path.as_posix()}",
             f"KERNEL_SRC={args.source.resolve()}",
+            # Qualcomm wrappers locate sibling generated Module.symvers files
+            # as $(OUT_DIR)/../sm8450-modules.  External Kbuild output mirrors
+            # that layout beside the kernel output directory, not in source.
             f"OUT_DIR={args.out.resolve()}",
             f"O={args.out.resolve()}",
             f"ARCH={args.arch}",
         ]
-        run(command + ["modules"], env)
+        # Use each wrapper's default build target.  Qualcomm trees are not
+        # uniform here: most expose `modules`, while datarmnet exposes only an
+        # `all` target that delegates to the kernel's modules target.
+        run(command, env)
         run(
             command
             + [
@@ -118,6 +195,106 @@ def install_external_modules(args, make, env):
             ],
             env,
         )
+
+
+def reset_module_install_tree(dist):
+    """Remove stale module-install outputs while preserving the build cache."""
+    for relative in ("lib/modules", "modules"):
+        path = dist / relative
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+
+
+def stage_kernel_modules(dist):
+    """Expose installed modules through stable basename-only build outputs."""
+    staging = dist / "modules"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+
+    modules = sorted(dist.rglob("*.ko"))
+    if not modules:
+        raise RuntimeError("kernel build did not install any modules")
+
+    seen = {}
+    staged = []
+    for module in modules:
+        name = module.name
+        previous = seen.get(name)
+        if previous is not None:
+            raise RuntimeError(
+                "duplicate installed kernel module basename "
+                f"{name}: {previous} and {module}"
+            )
+        destination = staging / name
+        shutil.copy2(module, destination)
+        seen[name] = module
+        staged.append(name)
+
+    (dist / "modules.list").write_text(
+        "".join(f"{name}\n" for name in staged), encoding="utf-8"
+    )
+
+
+def package_merged_dtb(args, env):
+    """Merge device-specific overlays into the selected DTB variants."""
+    if not args.dtb_base:
+        if args.dtb_overlay or args.dtb_output:
+            raise RuntimeError("DTB overlays require at least one --dtb-base")
+        return
+    if not args.dtb_output:
+        raise RuntimeError("DTB bases require --dtb-output")
+
+    fdtoverlay = None
+    if args.dtb_overlay:
+        fdtoverlay = shutil.which("fdtoverlay")
+        if not fdtoverlay:
+            raise RuntimeError("fdtoverlay is required to assemble source-built DTBs")
+
+    dts_root = args.out / "arch" / args.arch / "boot" / "dts" / "vendor"
+    overlays = [dts_root / overlay for overlay in args.dtb_overlay]
+    missing_overlays = [str(path) for path in overlays if not path.is_file()]
+    if missing_overlays:
+        raise FileNotFoundError(
+            "kernel build did not produce requested DTB overlays: "
+            + ", ".join(missing_overlays)
+        )
+
+    output = args.dtb_output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    variants_dir = output.parent / "dtb"
+    if variants_dir.exists():
+        shutil.rmtree(variants_dir)
+    variants_dir.mkdir(parents=True)
+
+    variants = []
+    for relative in args.dtb_base:
+        base = dts_root / relative
+        if not base.is_file():
+            raise FileNotFoundError(f"kernel build did not produce DTB base: {base}")
+        variant = variants_dir / pathlib.PurePosixPath(relative).name
+        if overlays:
+            run(
+                [
+                    fdtoverlay,
+                    "-i",
+                    str(base),
+                    "-o",
+                    str(variant),
+                    *(str(path) for path in overlays),
+                ],
+                env,
+            )
+        else:
+            shutil.copy2(base, variant)
+        variants.append(variant)
+
+    with output.open("wb") as image:
+        for variant in variants:
+            with variant.open("rb") as source:
+                shutil.copyfileobj(source, image)
 
 
 def build_kernel_platform(args, jobs, env):
@@ -185,16 +362,19 @@ def main():
     args.dist = args.dist.resolve()
     if args.external_module_root:
         args.external_module_root = args.external_module_root.resolve()
+    if args.dtb_output:
+        args.dtb_output = args.dtb_output.resolve()
     if args.platform_root:
         args.platform_root = args.platform_root.resolve()
+
+    host_tool_shims = create_host_tool_shims(args.out)
 
     jobs = os.environ.get("KLEE_KERNEL_JOBS") or str(os.cpu_count() or 1)
     if not jobs.isdigit() or int(jobs) < 1:
         raise ValueError("KLEE_KERNEL_JOBS must be a positive integer")
 
     host_tag = "linux-x86"
-    clang_version = os.environ.get("LLVM_AOSP_PREBUILTS_VERSION", "clang-stable")
-    clang = top / "prebuilts" / "clang" / "host" / host_tag / clang_version
+    clang = resolve_clang_prebuilt(top)
     build_tools = top / "prebuilts" / "build-tools" / host_tag / "bin"
     kernel_tools = top / "prebuilts" / "kernel-build-tools" / host_tag / "bin"
     make = build_tools / "make"
@@ -208,6 +388,7 @@ def main():
     env["PATH"] = os.pathsep.join(
         [
             str(clang / "bin"),
+            str(host_tool_shims),
             str(build_tools),
             str(kernel_tools),
             *os.defpath.split(os.pathsep),
@@ -244,6 +425,7 @@ def main():
     if args.dtbo_target:
         targets.append(args.dtbo_target)
     run(base_command + targets, env)
+    reset_module_install_tree(args.dist)
     run(
         base_command
         + [
@@ -253,13 +435,9 @@ def main():
         ],
         env,
     )
-    install_external_modules(args, make, env)
-
-    modules = sorted(args.dist.rglob("*.ko"))
-    (args.dist / "modules.list").write_text(
-        "".join(f"{module.relative_to(args.dist)}\n" for module in modules),
-        encoding="utf-8",
-    )
+    install_external_modules(args, make, jobs, env)
+    stage_kernel_modules(args.dist)
+    package_merged_dtb(args, env)
 
 
 if __name__ == "__main__":

@@ -56,8 +56,21 @@ KLEE_KERNEL_BUILD_ARGUMENTS += \
     $(foreach module,$(TARGET_KERNEL_EXT_MODULES),--external-module $(module))
 endif
 
+ifneq ($(strip $(TARGET_KERNEL_DTB_BASES)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    $(foreach base,$(TARGET_KERNEL_DTB_BASES),--dtb-base $(base)) \
+    $(foreach overlay,$(TARGET_KERNEL_DTB_OVERLAYS),--dtb-overlay $(overlay)) \
+    --dtb-output $(KLEE_KERNEL_DTB_IMAGE)
+endif
+
 ifeq ($(TARGET_NEEDS_DTBOIMAGE),true)
+# Conventional kernel trees do not universally expose a make target named
+# dtbo.img. Only request it when this build owns the DTBO input; device trees
+# that deliberately retain an ABI-matched prebuilt DTBO must not invoke an
+# unsupported kernel make target.
+ifeq ($(BOARD_PREBUILT_DTBOIMAGE),$(KLEE_KERNEL_DTBO_IMAGE))
 KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-target $(KLEE_KERNEL_DTBO_TARGET)
+endif
 endif
 endif
 
@@ -93,6 +106,19 @@ $(KLEE_LEGACY_KERNEL_UAPI): $(KLEE_KERNEL_IMAGE)
 ifneq ($(strip $(INSTALLED_KERNEL_TARGET)),)
 $(INSTALLED_KERNEL_TARGET): $(KLEE_KERNEL_IMAGE)
 	@echo "Installing Klee kernel image: $@"
+	$(copy-file-to-target)
+endif
+
+# A source-built conventional kernel may provide a device-specific merged DTB
+# image. Keep its dependency explicit so vendor_boot and recovery cannot pick
+# up a stale prebuilt DTB after the kernel configuration changes.
+ifneq ($(strip $(TARGET_KERNEL_DTB_BASES)),)
+KLEE_INSTALLED_DTBIMAGE_TARGET := $(PRODUCT_OUT)/dtb.img
+$(KLEE_KERNEL_DTB_IMAGE): $(KLEE_KERNEL_IMAGE)
+	@test -f "$@" || { echo "Missing generated DTB image: $@"; exit 1; }
+
+$(KLEE_INSTALLED_DTBIMAGE_TARGET): $(KLEE_KERNEL_DTB_IMAGE)
+	@echo "Installing Klee DTB image: $@"
 	$(copy-file-to-target)
 endif
 
