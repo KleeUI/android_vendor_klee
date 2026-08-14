@@ -27,6 +27,18 @@ KLEE_KERNEL_SOURCE_INPUTS := \
     $(KLEE_KERNEL_CONFIG_INPUTS)
 endif
 
+# External Qualcomm modules are built as side effects of the kernel target.
+# Track their source files explicitly so an incremental build cannot reuse a
+# stale module merely because the core kernel image itself is unchanged.
+ifneq ($(strip $(TARGET_KERNEL_EXT_MODULE_ROOT)),)
+KLEE_KERNEL_EXTERNAL_MODULE_INPUTS := \
+    $(sort $(shell find \
+        $(foreach module,$(TARGET_KERNEL_EXT_MODULES), \
+            $(TARGET_KERNEL_EXT_MODULE_ROOT)/$(module)) \
+        -type f -not -path '*/.git/*' 2>/dev/null))
+KLEE_KERNEL_SOURCE_INPUTS += $(KLEE_KERNEL_EXTERNAL_MODULE_INPUTS)
+endif
+
 KLEE_KERNEL_BUILD_ARGUMENTS := \
     --source $(TARGET_KERNEL_SOURCE) \
     --out $(KLEE_KERNEL_OUT) \
