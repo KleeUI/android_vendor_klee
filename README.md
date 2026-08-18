@@ -72,7 +72,7 @@ export KLEE_BUILD_JOBS=20
 klee_build
 ```
 
-For memory-constrained hosts, `klee_build` disables Soong incremental action analysis by default to keep the configuration graph within RAM. Set `KLEE_SOONG_INCREMENTAL_ANALYSIS=true` to opt into the faster incremental-analysis mode when the host has sufficient memory.
+On memory-constrained hosts, set `KLEE_SOONG_INCREMENTAL_ANALYSIS=false` to disable Soong incremental action analysis for that build shell. Set it to `true` to force the incremental mode, or leave it unset to preserve the AOSP release default.
 
 If neither form supplies a job count, the Android build system chooses its own
 parallelism. `klee_build` uses `droid` when no build goal is specified, while
