@@ -137,7 +137,9 @@ function klee_build()
         set -- -j"$jobs" "$@"
     fi
 
-    m "$@"
+    # Keep the large Soong graph within the server memory budget. Set KLEE_SOONG_INCREMENTAL_ANALYSIS=true to opt in.
+    local soong_incremental="${KLEE_SOONG_INCREMENTAL_ANALYSIS:-false}"
+    SOONG_INCREMENTAL_ANALYSIS="$soong_incremental" m "$@"
 }
 
 function mka()
