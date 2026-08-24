@@ -4,7 +4,7 @@
      SPDX-License-Identifier: Apache-2.0
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="org.klee.qtitelephony.compat">
+    package="org.klee.qtitelephony.broadcastcompat">
 
     <protected-broadcast android:name="org.codeaurora.intent.action.RADIO_POWER_STATE" />
     <protected-broadcast android:name="org.codeaurora.intent.action.ESSENTIAL_RECORDS_LOADED" />
