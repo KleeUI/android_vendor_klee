@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 
 def parse_args():
@@ -408,6 +409,23 @@ def build_kernel_platform(args, jobs, env):
 
     args.out.mkdir(parents=True, exist_ok=True)
     args.dist.mkdir(parents=True, exist_ok=True)
+    # Never accept an image left by a previous build.  The Android makefiles
+    # intentionally keep the kernel image and DT artifacts in one dist tree,
+    # so an old DTBO can otherwise satisfy a target even when this invocation
+    # did not compile the linked device DTS inputs.
+    stale_outputs = [args.dist / args.image]
+    if args.dtbo_target:
+        stale_outputs.append(args.dist / args.dtbo_target)
+    if args.dtb_output:
+        stale_outputs.append(args.dtb_output)
+    for output in stale_outputs:
+        if output.is_file() or output.is_symlink():
+            output.unlink()
+    for relative in args.dtb_base + args.dtb_overlay:
+        generated = platform_dtb_root(args) / relative
+        if generated.is_file() or generated.is_symlink():
+            generated.unlink()
+    build_started_ns = time.time_ns()
     platform_env = env.copy()
     platform_env["BUILD_CONFIG"] = build_config.as_posix()
     platform_env["OUT_DIR"] = str(args.out)
@@ -442,6 +460,20 @@ def build_kernel_platform(args, jobs, env):
         )
     validate_platform_dtbo(args)
     package_platform_dtb(args)
+    generated_outputs = [args.dist / args.image]
+    if args.dtbo_target:
+        generated_outputs.append(args.dist / args.dtbo_target)
+    if args.dtb_output:
+        generated_outputs.append(args.dtb_output)
+    stale = [
+        str(path)
+        for path in generated_outputs
+        if path.is_file() and path.stat().st_mtime_ns < build_started_ns
+    ]
+    if stale:
+        raise RuntimeError(
+            "platform build reused stale source artifacts: " + ", ".join(stale)
+        )
 
 
 def main():
