@@ -18,6 +18,11 @@ KLEE_KERNEL_SOURCE_INPUTS := \
         $(shell find $(KLEE_KERNEL_PLATFORM_PATH)/build -type f \
             -not -path '*/.git/*' 2>/dev/null) \
         $(KLEE_KERNEL_CONFIG_INPUTS))
+ifneq ($(strip $(KLEE_SOURCE_DTB_REQUIRED)),)
+KLEE_KERNEL_SOURCE_INPUTS += \
+    $(sort $(shell find -L $(KLEE_KERNEL_SOURCE_DTB_ROOT) -type f \
+        -not -path '*/.git/*' 2>/dev/null))
+endif
 else
 KLEE_KERNEL_CONFIG_INPUTS := $(foreach config,$(TARGET_KERNEL_CONFIG), \
     $(wildcard $(TARGET_KERNEL_SOURCE)/arch/$(KLEE_KERNEL_ARCH)/configs/$(config)))
@@ -52,6 +57,25 @@ KLEE_KERNEL_BUILD_ARGUMENTS += \
     --platform-root $(KLEE_KERNEL_PLATFORM_PATH) \
     --build-config $(KLEE_KERNEL_BUILD_CONFIG) \
     $(foreach flag,$(TARGET_KERNEL_ADDITIONAL_FLAGS),--make-arg $(flag))
+ifneq ($(strip $(TARGET_KERNEL_DTB_BASES)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    $(foreach base,$(TARGET_KERNEL_DTB_BASES),--dtb-base $(base)) \
+    $(foreach overlay,$(TARGET_KERNEL_DTB_OVERLAYS),--dtb-overlay $(overlay)) \
+    --dtb-output $(KLEE_KERNEL_DTB_IMAGE)
+endif
+ifneq ($(strip $(KLEE_SOURCE_DTB_REQUIRED)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    --dtb-source-root $(KLEE_KERNEL_SOURCE_DTB_ROOT) \
+    $(foreach marker,$(KLEE_KERNEL_DTB_SOURCE_MARKERS),--dtb-source-marker $(marker))
+endif
+ifeq ($(TARGET_NEEDS_DTBOIMAGE),true)
+ifeq ($(BOARD_PREBUILT_DTBOIMAGE),$(KLEE_KERNEL_DTBO_IMAGE))
+KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-target $(KLEE_KERNEL_DTBO_TARGET)
+ifneq ($(strip $(BOARD_DTBOIMG_PARTITION_SIZE)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-max-size $(BOARD_DTBOIMG_PARTITION_SIZE)
+endif
+endif
+endif
 ifeq ($(KLEE_KERNEL_SKIP_PLATFORM_DTBO),true)
 KLEE_KERNEL_BUILD_ARGUMENTS += --skip-platform-dtbo
 endif
@@ -82,6 +106,9 @@ ifeq ($(TARGET_NEEDS_DTBOIMAGE),true)
 # unsupported kernel make target.
 ifeq ($(BOARD_PREBUILT_DTBOIMAGE),$(KLEE_KERNEL_DTBO_IMAGE))
 KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-target $(KLEE_KERNEL_DTBO_TARGET)
+ifneq ($(strip $(BOARD_DTBOIMG_PARTITION_SIZE)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-max-size $(BOARD_DTBOIMG_PARTITION_SIZE)
+endif
 endif
 endif
 endif

@@ -31,6 +31,9 @@ def parse_args():
     parser.add_argument("--dtb-base", action="append", default=[])
     parser.add_argument("--dtb-overlay", action="append", default=[])
     parser.add_argument("--dtb-output", type=pathlib.Path)
+    parser.add_argument("--dtb-source-root", type=pathlib.Path)
+    parser.add_argument("--dtb-source-marker", action="append", default=[])
+    parser.add_argument("--dtbo-max-size", type=lambda value: int(value, 0))
     parser.add_argument("--external-module-root", type=pathlib.Path)
     parser.add_argument("--external-module", action="append", default=[])
     return parser.parse_args()
@@ -297,6 +300,88 @@ def package_merged_dtb(args, env):
                 shutil.copyfileobj(source, image)
 
 
+def validate_source_dtb_tree(args, platform):
+    """Require the platform build to see the tracked device DTS tree."""
+    source_root = args.dtb_source_root
+    if source_root is None:
+        source_root = (
+            platform
+            / "msm-kernel"
+            / "arch"
+            / args.arch
+            / "boot"
+            / "dts"
+            / "vendor"
+        )
+    source_root = source_root.resolve()
+    required = [source_root / "Makefile", source_root / "qcom" / "Makefile"]
+    required.extend(source_root / marker for marker in args.dtb_source_marker)
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "source DT tree is incomplete; refusing stock DT fallback: "
+            + ", ".join(missing)
+        )
+    return source_root
+
+
+def platform_dtb_root(args):
+    return args.out / "arch" / args.arch / "boot" / "dts" / "vendor"
+
+
+def package_platform_dtb(args):
+    """Package selected base DTBs while leaving overlays in dtbo.img."""
+    if not args.dtb_base:
+        if args.dtb_output or args.dtb_overlay:
+            raise RuntimeError(
+                "platform source DT packaging requires at least one --dtb-base"
+            )
+        return
+    if not args.dtb_output:
+        raise RuntimeError("DTB bases require --dtb-output")
+
+    dts_root = platform_dtb_root(args)
+    bases = [dts_root / base for base in args.dtb_base]
+    overlays = [dts_root / overlay for overlay in args.dtb_overlay]
+    missing_bases = [str(path) for path in bases if not path.is_file()]
+    missing_overlays = [str(path) for path in overlays if not path.is_file()]
+    if missing_bases:
+        raise FileNotFoundError(
+            "platform build did not produce requested source DTB bases: "
+            + ", ".join(missing_bases)
+        )
+    if missing_overlays:
+        raise FileNotFoundError(
+            "platform build did not produce requested source DTBO overlays: "
+            + ", ".join(missing_overlays)
+        )
+
+    output = args.dtb_output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("wb") as image:
+        for base in bases:
+            with base.open("rb") as source:
+                shutil.copyfileobj(source, image)
+    if output.stat().st_size == 0:
+        raise RuntimeError("source DTB packaging produced an empty dtb.img")
+
+
+def validate_platform_dtbo(args):
+    if not args.dtbo_target:
+        return
+    image = args.dist / args.dtbo_target
+    if not image.is_file() or image.stat().st_size == 0:
+        raise RuntimeError(
+            "platform build did not produce a non-empty source-built DTBO image: "
+            + str(image)
+        )
+    if args.dtbo_max_size is not None and image.stat().st_size > args.dtbo_max_size:
+        raise RuntimeError(
+            f"source-built DTBO image exceeds partition capacity: "
+            f"{image.stat().st_size} > {args.dtbo_max_size}"
+        )
+
+
 def build_kernel_platform(args, jobs, env):
     if not args.platform_root or not args.build_config:
         raise RuntimeError(
@@ -317,6 +402,9 @@ def build_kernel_platform(args, jobs, env):
         raise FileNotFoundError(f"kernel platform config not found: {config_path}")
     if not build_script.is_file():
         raise FileNotFoundError(f"kernel platform builder not found: {build_script}")
+
+    if args.dtb_source_root or args.dtb_source_marker or args.dtb_base:
+        validate_source_dtb_tree(args, platform)
 
     args.out.mkdir(parents=True, exist_ok=True)
     args.dist.mkdir(parents=True, exist_ok=True)
@@ -352,6 +440,8 @@ def build_kernel_platform(args, jobs, env):
             "kernel platform did not produce a complete KERNEL_KIT: "
             + ", ".join(missing)
         )
+    validate_platform_dtbo(args)
+    package_platform_dtb(args)
 
 
 def main():
@@ -364,6 +454,8 @@ def main():
         args.external_module_root = args.external_module_root.resolve()
     if args.dtb_output:
         args.dtb_output = args.dtb_output.resolve()
+    if args.dtb_source_root:
+        args.dtb_source_root = args.dtb_source_root.resolve()
     if args.platform_root:
         args.platform_root = args.platform_root.resolve()
 
@@ -400,10 +492,10 @@ def main():
     )
 
     if args.platform_root or args.build_config:
-        if args.config or args.external_module or args.dtbo_target:
+        if args.config or args.external_module:
             raise ValueError(
                 "kernel platform builds cannot use conventional config, module, "
-                "or DTBO arguments"
+                "arguments"
             )
         build_kernel_platform(args, jobs, env)
         return
