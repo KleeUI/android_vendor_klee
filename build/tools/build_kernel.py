@@ -315,9 +315,14 @@ def validate_source_dtb_tree(args, platform):
             / "vendor"
         )
     source_root = source_root.resolve()
-    required = [source_root / "Makefile", source_root / "qcom" / "Makefile"]
-    required.extend(source_root / marker for marker in args.dtb_source_marker)
-    missing = [str(path) for path in required if not path.is_file()]
+    required_files = [source_root / "Makefile", source_root / "qcom" / "Makefile"]
+    markers = [source_root / marker for marker in args.dtb_source_marker]
+    # A binding directory may be represented by a tracked symlink (for
+    # example bindings/media/camera -> ../../qcom/camera/bindings).  Follow
+    # that link when validating source markers, while still requiring the
+    # root and qcom Makefiles to be regular files.
+    missing = [str(path) for path in required_files if not path.is_file()]
+    missing.extend(str(path) for path in markers if not path.exists())
     if missing:
         raise FileNotFoundError(
             "source DT tree is incomplete; refusing stock DT fallback: "
