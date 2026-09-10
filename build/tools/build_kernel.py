@@ -446,14 +446,16 @@ def build_kernel_platform(args, jobs, env):
     # intentionally keep the kernel image and DT artifacts in one dist tree,
     # so an old DTBO can otherwise satisfy a target even when this invocation
     # did not compile the linked device DTS inputs.
-    stale_outputs = [args.dist / args.image]
+    stale_outputs = [args.dist / args.image, args.dist / "modules.list"]
     if args.dtbo_target:
         stale_outputs.append(args.dist / args.dtbo_target)
     if args.dtb_output:
         stale_outputs.append(args.dtb_output)
+    stale_outputs.extend(args.dist.glob("*.ko"))
     for output in stale_outputs:
         if output.is_file() or output.is_symlink():
             output.unlink()
+    reset_module_install_tree(args.dist)
     for relative in args.dtb_base + args.dtb_overlay:
         generated = platform_dtb_root(args) / relative
         if generated.is_file() or generated.is_symlink():
