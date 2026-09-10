@@ -57,6 +57,11 @@ KLEE_KERNEL_BUILD_ARGUMENTS += \
     --platform-root $(KLEE_KERNEL_PLATFORM_PATH) \
     --build-config $(KLEE_KERNEL_BUILD_CONFIG) \
     $(foreach flag,$(TARGET_KERNEL_ADDITIONAL_FLAGS),--make-arg $(flag))
+ifneq ($(strip $(TARGET_KERNEL_EXT_MODULE_ROOT)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    --external-module-root $(TARGET_KERNEL_EXT_MODULE_ROOT) \
+    $(foreach module,$(TARGET_KERNEL_EXT_MODULES),--external-module $(module))
+endif
 ifneq ($(strip $(TARGET_KERNEL_DTB_BASES)),)
 KLEE_KERNEL_BUILD_ARGUMENTS += \
     $(foreach base,$(TARGET_KERNEL_DTB_BASES),--dtb-base $(base)) \

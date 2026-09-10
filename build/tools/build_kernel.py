@@ -242,6 +242,34 @@ def stage_kernel_modules(dist):
     )
 
 
+def prepare_platform_external_output_alias(args, platform):
+    """Expose Qualcomm's historical sibling module output layout."""
+    if not args.external_module_root:
+        return
+
+    kernel_out = args.out / args.source.relative_to(platform)
+    external_relative = pathlib.PurePosixPath(
+        os.path.relpath(args.external_module_root, args.source)
+    )
+    actual_output = (kernel_out / external_relative).resolve()
+    alias = args.out / args.external_module_root.name
+    if alias.resolve() == actual_output:
+        return
+
+    if alias.is_symlink():
+        if alias.resolve() == actual_output:
+            return
+        alias.unlink()
+    elif alias.exists():
+        if alias.is_dir():
+            shutil.rmtree(alias)
+        else:
+            alias.unlink()
+
+    actual_output.mkdir(parents=True, exist_ok=True)
+    alias.symlink_to(os.path.relpath(actual_output, alias.parent))
+
+
 def package_merged_dtb(args, env):
     """Merge device-specific overlays into the selected DTB variants."""
     if not args.dtb_base:
@@ -435,6 +463,31 @@ def build_kernel_platform(args, jobs, env):
     platform_env["BUILD_CONFIG"] = build_config.as_posix()
     platform_env["OUT_DIR"] = str(args.out)
     platform_env["DIST_DIR"] = str(args.dist)
+    if args.external_module:
+        if not args.external_module_root:
+            raise RuntimeError("external modules require --external-module-root")
+
+        # kernel_platform/build.sh owns the platform output layout.  Passing
+        # EXT_MODULES to it keeps external modules on the exact same
+        # .config, Module.symvers, compiler and staging path as the in-tree
+        # modules instead of attempting a second, incompatible Kbuild.
+        external_modules = []
+        for relative in args.external_module:
+            module = (args.external_module_root / relative).resolve()
+            if not module.is_dir():
+                raise FileNotFoundError(
+                    f"external module directory not found: {module}"
+                )
+            external_modules.append(
+                pathlib.PurePosixPath(
+                    os.path.relpath(module, platform)
+                ).as_posix()
+            )
+        platform_env["EXT_MODULES"] = " ".join(external_modules)
+        # A stale shell environment must not silently suppress the requested
+        # source modules.
+        platform_env.pop("SKIP_EXT_MODULES", None)
+        prepare_platform_external_output_alias(args, platform)
     if args.skip_platform_dtbo:
         platform_env["DT_OVERLAY_SUPPORT"] = "0"
         # Public Qualcomm kernel releases can omit the retail board DT
@@ -463,6 +516,12 @@ def build_kernel_platform(args, jobs, env):
             "kernel platform did not produce a complete KERNEL_KIT: "
             + ", ".join(missing)
         )
+    # build.sh installs both in-tree and external modules in its staging
+    # directory and copies the resulting .ko files into DIST_DIR.  Android's
+    # Klee packaging graph consumes a stable basename-only directory, so
+    # normalize that output only after the platform build has completed.
+    reset_module_install_tree(args.dist)
+    stage_kernel_modules(args.dist)
     validate_platform_dtbo(args)
     package_platform_dtb(args)
     generated_outputs = [args.dist / args.image]
@@ -529,10 +588,9 @@ def main():
     )
 
     if args.platform_root or args.build_config:
-        if args.config or args.external_module:
+        if args.config:
             raise ValueError(
-                "kernel platform builds cannot use conventional config, module, "
-                "arguments"
+                "kernel platform builds cannot use conventional config arguments"
             )
         build_kernel_platform(args, jobs, env)
         return
