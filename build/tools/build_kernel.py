@@ -4,15 +4,19 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build a conventional GKI kernel tree inside an Android source checkout."""
+"""Build and verify a Klee kernel bundle inside an Android checkout."""
 
 import argparse
+import hashlib
+import json
 import os
 import pathlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -26,6 +30,8 @@ def parse_args():
     parser.add_argument("--config", action="append", default=[])
     parser.add_argument("--make-arg", action="append", default=[])
     parser.add_argument("--dtbo-target")
+    parser.add_argument("--dtbo-output", type=pathlib.Path)
+    parser.add_argument("--dt-layout", type=pathlib.Path)
     parser.add_argument("--platform-root", type=pathlib.Path)
     parser.add_argument("--build-config")
     parser.add_argument("--skip-platform-dtbo", action="store_true")
@@ -37,6 +43,10 @@ def parse_args():
     parser.add_argument("--dtbo-max-size", type=lambda value: int(value, 0))
     parser.add_argument("--external-module-root", type=pathlib.Path)
     parser.add_argument("--external-module", action="append", default=[])
+    parser.add_argument("--required-module", action="append", default=[])
+    parser.add_argument("--retained-provenance", type=pathlib.Path)
+    parser.add_argument("--source-manifest", type=pathlib.Path)
+    parser.add_argument("--stamp", type=pathlib.Path)
     return parser.parse_args()
 
 
@@ -153,8 +163,9 @@ def configure_kernel(args, make, base_command, env):
         run(base_command + ["olddefconfig"], env)
 
 
-def install_external_modules(args, make, jobs, env):
-    if not args.external_module:
+def install_external_modules(args, make, jobs, env, module_values=None):
+    modules = args.external_module if module_values is None else module_values
+    if not modules:
         return
     if not args.external_module_root:
         raise RuntimeError("external modules require --external-module-root")
@@ -163,9 +174,12 @@ def install_external_modules(args, make, jobs, env):
         os.path.relpath(args.external_module_root, args.source)
     )
 
-    for relative in args.external_module:
-        module = (args.external_module_root / relative).resolve()
-        if not module.is_dir():
+    for relative in modules:
+        module = args.external_module_root.joinpath(
+            *pathlib.PurePosixPath(relative).parts
+        )
+        module_real = module.resolve()
+        if not module_real.is_dir():
             raise FileNotFoundError(f"external module directory not found: {module}")
 
         # The Android shell exports ANDROID_BUILD_TOP, but the standalone
@@ -176,7 +190,7 @@ def install_external_modules(args, make, jobs, env):
         # for every other Qualcomm wrapper (some legacy audio Kbuild files
         # still use ANDROID_BUILD_TOP), and isolate only qcacld.
         module_env = env
-        if module.name == "qcacld-3.0":
+        if module_real.name == "qcacld-3.0":
             module_env = env.copy()
             module_env.pop("ANDROID_BUILD_TOP", None)
 
@@ -198,6 +212,27 @@ def install_external_modules(args, make, jobs, env):
             f"O={args.out.resolve()}",
             f"ARCH={args.arch}",
         ]
+        # CVP and EVA are separate Qualcomm source projects. Their Kbuild
+        # wrappers intentionally leave the module selector to the caller;
+        # make that ownership explicit instead of relying on a product
+        # Android.mk side effect.
+        if module_real.name == "cvp-kernel":
+            command.append("CONFIG_MSM_CVP=m")
+        elif module_real.name == "eva-kernel":
+            command.append("CONFIG_MSM_EVA=m")
+        # Every external module consumes the platform KMI. Supplying the
+        # freshly generated symbol table also avoids stale sibling paths from
+        # older Xiaomi trees being selected by a wrapper.
+        symbol_tables = [args.out / "Module.symvers"]
+        symbol_tables.extend(
+            path
+            for path in args.out.rglob("Module.symvers")
+            if path != args.out / "Module.symvers"
+        )
+        command.append(
+            "KBUILD_EXTRA_SYMBOLS="
+            + " ".join(str(path) for path in symbol_tables)
+        )
         # Use each wrapper's default build target.  Qualcomm trees are not
         # uniform here: most expose `modules`, while datarmnet exposes only an
         # `all` target that delegates to the kernel's modules target.
@@ -254,6 +289,87 @@ def stage_kernel_modules(dist):
     )
 
 
+def build_qcacld_variants(args, make, jobs, env):
+    """Build both WLAN profiles from one tracked qcacld source tree.
+
+    Qualcomm's Android.mk normally creates ``.qca6490`` and ``.qca6750``
+    aliases while parsing the product.  Klee does not depend on that mutable
+    parse-time side effect: each profile gets an ephemeral source alias and a
+    separate Kbuild module output path, while both builds consume the same
+    platform .config and Module.symvers.
+    """
+    if not args.external_module_root:
+        return
+    qcacld = None
+    for relative in args.external_module:
+        candidate = args.external_module_root.joinpath(
+            *pathlib.PurePosixPath(relative).parts
+        )
+        if candidate.name == "qcacld-3.0":
+            qcacld = candidate.resolve()
+            break
+    if qcacld is None:
+        return
+    kernel_relative = pathlib.PurePosixPath(
+        os.path.relpath(qcacld, args.source)
+    )
+    aliases = []
+    try:
+        for profile in ("qca6490", "qca6750"):
+            alias = qcacld / f".klee-{profile}"
+            if alias.exists() or alias.is_symlink():
+                if not alias.is_symlink() or alias.resolve() != qcacld:
+                    raise RuntimeError(
+                        "refusing to replace existing qcacld alias: " + str(alias)
+                    )
+            else:
+                alias.symlink_to(qcacld, target_is_directory=True)
+                aliases.append(alias)
+            module_relative = kernel_relative / f".klee-{profile}"
+            module_name = f"qca_cld3_{profile}"
+            profile_upper = profile.upper()
+            command = [
+                str(make),
+                f"-j{jobs}",
+                "-C",
+                str(qcacld),
+                f"M={module_relative.as_posix()}",
+                f"KERNEL_SRC={args.source.resolve()}",
+                f"OUT_DIR={args.out.resolve()}",
+                f"O={args.out.resolve()}",
+                f"ARCH={args.arch}",
+                f"WLAN_ROOT={qcacld}",
+                "WLAN_COMMON_ROOT=cmn",
+                f"WLAN_COMMON_INC={qcacld / 'cmn'}",
+                f"WLAN_FW_API={qcacld.parent / 'fw-api'}",
+                f"WLAN_PROFILE={profile}",
+                f"CONFIG_QCA_CLD_WLAN_PROFILE={profile}",
+                f"MODNAME={module_name}",
+                f"DEVNAME={profile}",
+                "CONFIG_QCA_CLD_WLAN=m",
+                "CONFIG_QCA_WIFI_ISOC=0",
+                "CONFIG_QCA_WIFI_2_0=1",
+                f"CONFIG_CNSS_{profile_upper}=y",
+                f"CONFIG_QCA{profile_upper}_HEADERS_DEF=y",
+                "WLAN_CTRL_NAME=wlan",
+                f"KBUILD_EXTRA_SYMBOLS={args.out / 'Module.symvers'}",
+            ]
+            run(command, env)
+            run(
+                command
+                + [
+                    "modules_install",
+                    f"INSTALL_MOD_PATH={args.dist.resolve()}",
+                    "INSTALL_MOD_STRIP=1",
+                ],
+                env,
+            )
+    finally:
+        for alias in aliases:
+            if alias.is_symlink():
+                alias.unlink()
+
+
 def prepare_platform_external_output_alias(args, platform):
     """Expose Qualcomm's historical sibling module output layout."""
     if not args.external_module_root:
@@ -280,6 +396,32 @@ def prepare_platform_external_output_alias(args, platform):
 
     actual_output.mkdir(parents=True, exist_ok=True)
     alias.symlink_to(os.path.relpath(actual_output, alias.parent))
+
+
+def reset_platform_external_outputs(args, platform):
+    """Remove only generated external-module output from the product tree."""
+    # build.sh derives EXT_MOD_REL from the kernel source. With Qualcomm
+    # projects living outside kernel_platform this places object files below
+    # the product output's vendor/ directory. Clear those exact derived paths
+    # so removed modules and old Module.symvers files cannot leak forward.
+    product_root = args.out.parent.parent.resolve()
+    for relative in args.external_module:
+        module = args.external_module_root.joinpath(
+            *pathlib.PurePosixPath(relative).parts
+        ).resolve()
+        generated = (args.out / os.path.relpath(module, platform)).resolve()
+        try:
+            generated.relative_to(product_root)
+        except ValueError as error:
+            raise RuntimeError(
+                "external module output escapes product output: " + str(generated)
+            ) from error
+        if generated == product_root or generated == args.out.resolve():
+            raise RuntimeError("refusing to clear kernel output root: " + str(generated))
+        if generated.is_symlink() or generated.is_file():
+            generated.unlink()
+        elif generated.is_dir():
+            shutil.rmtree(generated)
 
 
 def package_merged_dtb(args, env):
@@ -341,18 +483,1037 @@ def package_merged_dtb(args, env):
                 shutil.copyfileobj(source, image)
 
 
-def validate_source_dtb_tree(args, platform):
-    """Require the platform build to see the tracked device DTS tree."""
+def load_dt_layout(path):
+    """Load a device-owned DTB/DTBO assembly description."""
+    data = path.read_bytes()
+    try:
+        layout = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid UTF-8 DT layout {path}: {error}") from error
+
+    if not isinstance(layout, dict) or layout.get("version") != 1:
+        raise ValueError("DT layout must be an object with version 1")
+    allowed = {
+        "version",
+        "page_size",
+        "dtb_variants",
+        "dtbo_variants",
+        "allowed_dtb_selector_collisions",
+    }
+    unknown = sorted(set(layout) - allowed)
+    if unknown:
+        raise ValueError("unknown DT layout fields: " + ", ".join(unknown))
+    for key in ("dtb_variants", "dtbo_variants"):
+        variants = layout.get(key)
+        if not isinstance(variants, list) or not variants:
+            raise ValueError(f"DT layout requires a non-empty {key} list")
+    page_size = layout.get("page_size", 4096)
+    if (
+        not isinstance(page_size, int)
+        or isinstance(page_size, bool)
+        or page_size < 512
+        or page_size & (page_size - 1)
+    ):
+        raise ValueError("DT layout page_size must be a power of two >= 512")
+    validate_dt_layout_schema(layout)
+    return layout, hashlib.sha256(data).hexdigest()
+
+
+def hash_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_retained_provenance(path, top):
+    """Validate explicitly retained ABI-bound modules before packaging.
+
+    Retained modules are not source-built and must never be silently replaced
+    by an arbitrary file from a developer checkout. The device manifest is a
+    small, reviewable exception list with immutable size and SHA-256 records.
+    """
+    if path is None:
+        return
+    path = path.resolve()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid retained-module provenance {path}: {error}") from error
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise ValueError("retained-module provenance must use version 1")
+    entries = data.get("retained_prebuilt")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("retained-module provenance requires retained_prebuilt")
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise TypeError("retained-module provenance entries must be objects")
+        name = entry.get("name")
+        relative = entry.get("path")
+        expected_hash = entry.get("sha256")
+        expected_size = entry.get("size")
+        if (
+            not isinstance(name, str)
+            or pathlib.PurePosixPath(name).name != name
+            or pathlib.PurePosixPath(name).suffix != ".ko"
+            or name in seen
+        ):
+            raise ValueError(f"invalid or duplicate retained module name: {name}")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or "\\" in relative
+            or pathlib.PurePosixPath(relative).is_absolute()
+            or ".." in pathlib.PurePosixPath(relative).parts
+        ):
+            raise ValueError(f"invalid retained module path for {name}: {relative}")
+        if (
+            not isinstance(expected_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+            or not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size < 1
+        ):
+            raise ValueError(f"invalid retained module digest record for {name}")
+        module = (top / pathlib.PurePosixPath(relative)).resolve()
+        try:
+            module.relative_to(top.resolve())
+        except ValueError as error:
+            raise ValueError(f"retained module escapes checkout: {relative}") from error
+        if not module.is_file():
+            raise FileNotFoundError(f"retained module is missing: {module}")
+        actual_size = module.stat().st_size
+        actual_hash = hash_file(module)
+        if actual_size != expected_size or actual_hash != expected_hash:
+            raise RuntimeError(
+                f"retained module provenance mismatch for {name}: "
+                f"expected {expected_size} bytes/{expected_hash}, "
+                f"got {actual_size} bytes/{actual_hash}"
+            )
+        seen.add(name)
+
+
+def validate_source_manifest(path, top):
+    """Require every declared Qualcomm source project to be at its pin."""
+    if path is None:
+        return
+    path = path.resolve()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid Qualcomm source manifest {path}: {error}") from error
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise ValueError("Qualcomm source manifest must use version 1")
+    projects = data.get("projects")
+    if not isinstance(projects, list) or not projects:
+        raise ValueError("Qualcomm source manifest requires projects")
+    seen = set()
+    for project in projects:
+        if not isinstance(project, dict):
+            raise TypeError("Qualcomm source manifest entries must be objects")
+        relative = project.get("path")
+        revision = project.get("revision")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or "\\" in relative
+            or pathlib.PurePosixPath(relative).is_absolute()
+            or ".." in pathlib.PurePosixPath(relative).parts
+            or relative in seen
+            or not isinstance(revision, str)
+            or not re.fullmatch(r"[0-9a-f]{40}", revision)
+        ):
+            raise ValueError(f"invalid Qualcomm source manifest entry: {project}")
+        source = (top / pathlib.PurePosixPath(relative)).resolve()
+        try:
+            source.relative_to(top.resolve())
+        except ValueError as error:
+            raise ValueError(f"source project escapes checkout: {relative}") from error
+        if not source.is_dir():
+            raise FileNotFoundError(f"Qualcomm source project is missing: {source}")
+        try:
+            actual = subprocess.check_output(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                text=True,
+                stderr=subprocess.STDOUT,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(f"cannot inspect Qualcomm source project: {source}") from error
+        if actual != revision:
+            raise RuntimeError(
+                f"Qualcomm source pin mismatch for {relative}: "
+                f"expected {revision}, got {actual}"
+            )
+        seen.add(relative)
+
+
+def verify_layout_unchanged(path, expected_digest):
+    actual_digest = hash_file(path)
+    if actual_digest != expected_digest:
+        raise RuntimeError(
+            "DT layout changed while the kernel was building: "
+            f"expected {expected_digest}, got {actual_digest}"
+        )
+
+
+def validate_posix_relative_path(value, suffix, context):
+    if not isinstance(value, str):
+        raise TypeError(f"{context} paths must be strings")
+    relative = pathlib.PurePosixPath(value)
+    if (
+        not value
+        or "\\" in value
+        or relative.is_absolute()
+        or relative.as_posix() != value
+        or any(part in ("", ".", "..") for part in relative.parts)
+        or relative.suffix != suffix
+    ):
+        raise ValueError(f"invalid {suffix} path for {context}: {value}")
+    return relative
+
+
+def resolve_layout_artifact(root, value, suffix):
+    """Resolve one generated Kbuild artifact without allowing tree escapes."""
+    relative = validate_posix_relative_path(value, suffix, "DT layout artifact")
+    path = root.joinpath(*relative.parts)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"kernel build did not produce DT artifact: {path}")
+    try:
+        path.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except ValueError as error:
+        raise ValueError(f"DT artifact escapes generated tree: {value}") from error
+    return path
+
+
+def validate_variant_name(value, suffix):
+    name = validate_posix_relative_path(value, suffix, "DT layout variant")
+    if name.name != value:
+        raise ValueError(f"invalid {suffix} variant name in DT layout: {value}")
+    return value
+
+
+def validate_cell_properties(properties, context):
+    if properties is None:
+        return {}
+    if not isinstance(properties, dict):
+        raise TypeError(f"{context} properties must be an object")
+    for name, values in properties.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or "/" in name
+            or "\x00" in name
+        ):
+            raise ValueError(f"{context} property names must be non-empty strings")
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                or value > 0xFFFFFFFF
+                for value in values
+            )
+        ):
+            raise ValueError(
+                f"{context} property {name} must contain 32-bit integer cells"
+            )
+    return properties
+
+
+def validate_string_properties(properties, context):
+    if properties is None:
+        return {}
+    if not isinstance(properties, dict):
+        raise TypeError(f"{context} string properties must be an object")
+    for name, values in properties.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or "/" in name
+            or "\x00" in name
+        ):
+            raise ValueError(f"{context} property names must be non-empty strings")
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(
+                not isinstance(value, str) or not value or "\x00" in value
+                for value in values
+            )
+        ):
+            raise ValueError(
+                f"{context} property {name} must contain non-empty strings"
+            )
+    return properties
+
+
+def validate_node_path(value, context):
+    if not isinstance(value, str):
+        raise TypeError(f"{context} node paths must be strings")
+    path = pathlib.PurePosixPath(value)
+    if (
+        not value.startswith("/")
+        or (value != "/" and value.endswith("/"))
+        or path.as_posix() != value
+        or any(part in (".", "..") for part in path.parts)
+    ):
+        raise ValueError(f"invalid node path for {context}: {value}")
+    return value
+
+
+def validate_unique_string_list(values, context, validator=None):
+    if values is None:
+        return []
+    if (
+        not isinstance(values, list)
+        or any(not isinstance(value, str) or not value for value in values)
+        or len(set(values)) != len(values)
+    ):
+        raise ValueError(f"{context} must contain unique non-empty strings")
+    if validator:
+        for value in values:
+            validator(value, context)
+    return values
+
+
+def validate_node_property_map(nodes, context, value_validator):
+    if nodes is None:
+        return {}
+    if not isinstance(nodes, dict):
+        raise TypeError(f"{context} must be an object keyed by node path")
+    for node, properties in nodes.items():
+        validate_node_path(node, context)
+        value_validator(properties, f"{context} {node}")
+    return nodes
+
+
+def build_overlay_tools(top, args, make, jobs, env):
+    """Build the pinned DTC utilities used by Klee's DT assembler."""
+    source = top / "kernel_platform" / "external" / "dtc"
+    makefile = source / "Makefile"
+    if not makefile.is_file():
+        raise FileNotFoundError(
+            "tracked kernel_platform DTC tools are required for DT assembly: "
+            + str(makefile)
+        )
+    output = args.out / ".klee-dtc-tools"
+    output.mkdir(parents=True, exist_ok=True)
+    names = ("fdtoverlay", "fdtoverlaymerge", "fdtget", "fdtput")
+    tools = {name: output / name for name in names}
+    run(
+        [
+            str(make),
+            "-C",
+            str(source),
+            f"OUT_DIR={output}",
+            "NO_PYTHON=1",
+            "NO_YAML=1",
+            f"-j{jobs}",
+            *(str(tools[name]) for name in names),
+        ],
+        env,
+    )
+    missing = [str(path) for path in tools.values() if not path.is_file()]
+    if missing:
+        raise RuntimeError("DTC tool build is incomplete: " + ", ".join(missing))
+    return tools
+
+
+def resolve_mkdtimg(top):
+    """Use only the mkdtimg prebuilt pinned by the Android manifest."""
+    tool = top / "prebuilts" / "misc" / "linux-x86" / "libufdt" / "mkdtimg"
+    if not tool.is_file():
+        raise FileNotFoundError("pinned AOSP mkdtimg is missing: " + str(tool))
+    return tool
+
+
+def read_cell_property(fdtget, image, name, env, node="/"):
+    command = [str(fdtget), "-t", "i", str(image), node, name]
+    print("+", " ".join(command), flush=True)
+    result = subprocess.run(
+        command,
+        env=env,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    # fdtget prints signed cells for -t i. Normalize them back to the raw
+    # 32-bit representation used by layout files.
+    return [int(value, 0) & 0xFFFFFFFF for value in result.stdout.split()]
+
+
+def read_string_property(fdtget, image, name, env, node="/"):
+    command = [str(fdtget), "-t", "bx", str(image), node, name]
+    print("+", " ".join(command), flush=True)
+    result = subprocess.run(
+        command,
+        env=env,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    try:
+        raw = bytes(int(value, 16) for value in result.stdout.split())
+        values = raw.rstrip(b"\0").split(b"\0")
+        return [value.decode("utf-8") for value in values if value]
+    except (ValueError, UnicodeDecodeError) as error:
+        raise RuntimeError(
+            f"invalid string property {node}/{name} in {image}"
+        ) from error
+
+
+def fdt_property_exists(fdtget, image, node, name, env):
+    result = subprocess.run(
+        [str(fdtget), str(image), node, name],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def fdt_node_exists(fdtget, image, node, env):
+    result = subprocess.run(
+        [str(fdtget), "-p", str(image), node],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def verify_cell_properties(fdtget, image, node, properties, env, context):
+    expected = validate_cell_properties(properties, context)
+    for name, values in expected.items():
+        actual = read_cell_property(fdtget, image, name, env, node)
+        if actual != values:
+            raise RuntimeError(
+                f"{context} {image.name} property {node}/{name} mismatch: "
+                f"expected {values}, got {actual}"
+            )
+
+
+def verify_root_properties(fdtget, image, properties, env, context):
+    verify_cell_properties(fdtget, image, "/", properties, env, context)
+
+
+def verify_string_properties(fdtget, image, node, properties, env, context):
+    expected = validate_string_properties(properties, context)
+    for name, values in expected.items():
+        actual = read_string_property(fdtget, image, name, env, node)
+        if actual != values:
+            raise RuntimeError(
+                f"{context} {image.name} property {node}/{name} mismatch: "
+                f"expected {values}, got {actual}"
+            )
+
+
+def verify_dtb_semantics(fdtget, image, variant, env):
+    name = variant["name"]
+    verify_root_properties(
+        fdtget,
+        image,
+        variant.get("expected_root_properties"),
+        env,
+        f"DTB variant {name} root",
+    )
+    verify_string_properties(
+        fdtget,
+        image,
+        "/",
+        variant.get("expected_root_strings"),
+        env,
+        f"DTB variant {name} root",
+    )
+    for prop in variant.get("forbidden_root_properties", []):
+        if fdt_property_exists(fdtget, image, "/", prop, env):
+            raise RuntimeError(
+                f"DTB variant {name} contains forbidden root property {prop}"
+            )
+    for node in variant.get("required_nodes", []):
+        if not fdt_node_exists(fdtget, image, node, env):
+            raise RuntimeError(f"DTB variant {name} is missing required node {node}")
+    for node in variant.get("forbidden_nodes", []):
+        if fdt_node_exists(fdtget, image, node, env):
+            raise RuntimeError(f"DTB variant {name} contains forbidden node {node}")
+    for node, properties in variant.get("expected_node_properties", {}).items():
+        verify_cell_properties(
+            fdtget,
+            image,
+            node,
+            properties,
+            env,
+            f"DTB variant {name} node",
+        )
+    for node, properties in variant.get("expected_node_strings", {}).items():
+        verify_string_properties(
+            fdtget,
+            image,
+            node,
+            properties,
+            env,
+            f"DTB variant {name} node",
+        )
+
+
+def apply_root_properties(fdtput, fdtget, image, properties, env):
+    values_by_name = validate_cell_properties(properties, "DTBO root")
+    for name, values in values_by_name.items():
+        run(
+            [str(fdtput), "-t", "i", str(image), "/", name]
+            + [str(value) for value in values],
+            env,
+        )
+    verify_root_properties(
+        fdtget, image, values_by_name, env, "DTBO root"
+    )
+
+
+def parse_dtbo_metadata(variant):
+    allowed = {
+        "name",
+        "base",
+        "overlays",
+        "root_properties",
+        "expected_root_strings",
+        "applies_to",
+        "id",
+        "rev",
+        "custom",
+    }
+    unknown = sorted(set(variant) - allowed)
+    if unknown:
+        raise ValueError("unknown DTBO variant fields: " + ", ".join(unknown))
+
+    metadata = []
+    for key in ("id", "rev"):
+        value = variant.get(key, 0)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or value > 0xFFFFFFFF
+        ):
+            raise ValueError(f"DTBO {key} must be a 32-bit unsigned integer")
+        metadata.append(f"--{key}={value}")
+    custom = variant.get("custom", [0, 0, 0, 0])
+    if (
+        not isinstance(custom, list)
+        or len(custom) != 4
+        or any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or value > 0xFFFFFFFF
+            for value in custom
+        )
+    ):
+        raise ValueError("DTBO custom must contain exactly four 32-bit cells")
+    metadata.extend(f"--custom{index}={value}" for index, value in enumerate(custom))
+    return metadata
+
+
+def validate_dt_layout_schema(layout):
+    """Reject incomplete or ambiguous layouts before a long kernel build."""
+    dtb_allowed = {
+        "name",
+        "base",
+        "overlays",
+        "expected_root_properties",
+        "expected_root_strings",
+        "forbidden_root_properties",
+        "required_nodes",
+        "forbidden_nodes",
+        "expected_node_properties",
+        "expected_node_strings",
+    }
+    dtb_names = []
+    for variant in layout["dtb_variants"]:
+        if not isinstance(variant, dict):
+            raise TypeError("each DTB variant must be an object")
+        unknown = sorted(set(variant) - dtb_allowed)
+        if unknown:
+            raise ValueError("unknown DTB variant fields: " + ", ".join(unknown))
+        name = validate_variant_name(variant.get("name"), ".dtb")
+        if name in dtb_names:
+            raise ValueError(f"duplicate DTB variant name: {name}")
+        dtb_names.append(name)
+        validate_posix_relative_path(
+            variant.get("base"), ".dtb", f"DTB variant {name} base"
+        )
+        overlays = validate_unique_string_list(
+            variant.get("overlays", []), f"DTB variant {name} overlays"
+        )
+        for overlay in overlays:
+            validate_posix_relative_path(
+                overlay, ".dtbo", f"DTB variant {name} overlay"
+            )
+        expected_root = validate_cell_properties(
+            variant.get("expected_root_properties"), f"DTB variant {name} root"
+        )
+        if not expected_root:
+            raise ValueError(
+                f"DTB variant {name} requires expected_root_properties"
+            )
+        validate_string_properties(
+            variant.get("expected_root_strings"), f"DTB variant {name} root"
+        )
+        validate_unique_string_list(
+            variant.get("forbidden_root_properties"),
+            f"DTB variant {name} forbidden root properties",
+        )
+        validate_unique_string_list(
+            variant.get("required_nodes"),
+            f"DTB variant {name} required nodes",
+            validate_node_path,
+        )
+        validate_unique_string_list(
+            variant.get("forbidden_nodes"),
+            f"DTB variant {name} forbidden nodes",
+            validate_node_path,
+        )
+        validate_node_property_map(
+            variant.get("expected_node_properties"),
+            f"DTB variant {name} node properties",
+            validate_cell_properties,
+        )
+        validate_node_property_map(
+            variant.get("expected_node_strings"),
+            f"DTB variant {name} node strings",
+            validate_string_properties,
+        )
+
+    coverage = {name: [] for name in dtb_names}
+    dtbo_names = []
+    for variant in layout["dtbo_variants"]:
+        if not isinstance(variant, dict):
+            raise TypeError("each DTBO variant must be an object")
+        parse_dtbo_metadata(variant)
+        name = validate_variant_name(variant.get("name"), ".dtbo")
+        if name in dtbo_names:
+            raise ValueError(f"duplicate DTBO variant name: {name}")
+        dtbo_names.append(name)
+        base = validate_posix_relative_path(
+            variant.get("base"), ".dtbo", f"DTBO variant {name} base"
+        ).as_posix()
+        overlays = validate_unique_string_list(
+            variant.get("overlays"), f"DTBO variant {name} overlays"
+        )
+        if not overlays:
+            raise ValueError(f"DTBO variant {name} requires overlay inputs")
+        for overlay in overlays:
+            validate_posix_relative_path(
+                overlay, ".dtbo", f"DTBO variant {name} overlay"
+            )
+        if base in overlays:
+            raise ValueError(f"DTBO variant {name} repeats its base as an overlay")
+        root_properties = validate_cell_properties(
+            variant.get("root_properties"), f"DTBO variant {name} root"
+        )
+        if not root_properties:
+            raise ValueError(f"DTBO variant {name} requires root_properties")
+        validate_string_properties(
+            variant.get("expected_root_strings"), f"DTBO variant {name} root"
+        )
+        applies_to = validate_unique_string_list(
+            variant.get("applies_to"), f"DTBO variant {name} applies_to"
+        )
+        if not applies_to:
+            raise ValueError(f"DTBO variant {name} requires applies_to DTBs")
+        for dtb_name in applies_to:
+            validate_variant_name(dtb_name, ".dtb")
+            if dtb_name not in coverage:
+                raise ValueError(
+                    f"DTBO variant {name} references unknown DTB {dtb_name}"
+                )
+            coverage[dtb_name].append(name)
+
+    invalid_coverage = {
+        name: owners for name, owners in coverage.items() if len(owners) != 1
+    }
+    if invalid_coverage:
+        details = ", ".join(
+            f"{name}={owners}" for name, owners in invalid_coverage.items()
+        )
+        raise ValueError("every DTB must belong to exactly one DTBO: " + details)
+
+    collisions = layout.get("allowed_dtb_selector_collisions", [])
+    if not isinstance(collisions, list):
+        raise TypeError("allowed_dtb_selector_collisions must be a list")
+    seen_groups = set()
+    seen_members = set()
+    order = {name: index for index, name in enumerate(dtb_names)}
+    for group in collisions:
+        names = validate_unique_string_list(
+            group, "allowed DTB selector collision"
+        )
+        if len(names) < 2 or any(name not in order for name in names):
+            raise ValueError(
+                "allowed DTB selector collisions require at least two known DTBs"
+            )
+        if names != sorted(names, key=order.get):
+            raise ValueError(
+                "allowed DTB selector collision members must follow DTB order"
+            )
+        key = tuple(names)
+        if key in seen_groups or seen_members.intersection(names):
+            raise ValueError("DTB selector collision declarations overlap")
+        seen_groups.add(key)
+        seen_members.update(names)
+
+
+def split_msm_ids(values, context):
+    if not values or len(values) % 2:
+        raise RuntimeError(f"{context} qcom,msm-id must contain value/revision pairs")
+    return {tuple(values[index : index + 2]) for index in range(0, len(values), 2)}
+
+
+def verify_dtb_selector_collisions(fdtget, dtbs, layout, env):
+    groups = {}
+    for name, image in dtbs.items():
+        signature = (
+            tuple(read_string_property(fdtget, image, "compatible", env)),
+            tuple(read_cell_property(fdtget, image, "qcom,msm-id", env)),
+            tuple(read_cell_property(fdtget, image, "qcom,board-id", env)),
+        )
+        groups.setdefault(signature, []).append(name)
+
+    actual = {
+        tuple(names) for names in groups.values() if len(names) > 1
+    }
+    allowed = {
+        tuple(names)
+        for names in layout.get("allowed_dtb_selector_collisions", [])
+    }
+    if actual != allowed:
+        raise RuntimeError(
+            "DTB selector collisions differ from the device declaration: "
+            f"expected {sorted(allowed)}, got {sorted(actual)}"
+        )
+
+
+def validate_fdt_blob(data, context):
+    if len(data) < 8:
+        raise RuntimeError(f"{context} is too small to contain an FDT")
+    magic, total_size = struct.unpack_from(">II", data)
+    if magic != 0xD00DFEED:
+        raise RuntimeError(f"{context} has invalid FDT magic 0x{magic:08x}")
+    if total_size != len(data):
+        raise RuntimeError(
+            f"{context} FDT size mismatch: header {total_size}, file {len(data)}"
+        )
+
+
+def verify_concatenated_dtbs(image, variants):
+    actual = image.read_bytes()
+    expected_parts = []
+    for variant in variants:
+        data = variant.read_bytes()
+        validate_fdt_blob(data, str(variant))
+        expected_parts.append(data)
+    expected = b"".join(expected_parts)
+    if actual != expected:
+        raise RuntimeError(
+            "dtb.img is not the exact ordered concatenation of declared DTBs"
+        )
+
+
+def verify_dtbo_table(image, layout, entries):
+    data = image.read_bytes()
+    if len(data) < 32:
+        raise RuntimeError("dtbo.img is smaller than its table header")
+    (
+        magic,
+        total_size,
+        header_size,
+        entry_size,
+        entry_count,
+        entries_offset,
+        page_size,
+        version,
+    ) = struct.unpack_from(">8I", data)
+    expected_page_size = layout.get("page_size", 4096)
+    expected_header = (
+        0xD7B7AB1E,
+        len(data),
+        32,
+        32,
+        len(entries),
+        32,
+        expected_page_size,
+        0,
+    )
+    actual_header = (
+        magic,
+        total_size,
+        header_size,
+        entry_size,
+        entry_count,
+        entries_offset,
+        page_size,
+        version,
+    )
+    if actual_header != expected_header:
+        raise RuntimeError(
+            f"dtbo.img table header mismatch: expected {expected_header}, "
+            f"got {actual_header}"
+        )
+    table_end = entries_offset + entry_count * entry_size
+    if table_end > len(data):
+        raise RuntimeError("dtbo.img entry table extends past the image")
+
+    previous_end = table_end
+    for index, (variant, expected_image) in enumerate(entries):
+        offset = entries_offset + index * entry_size
+        values = struct.unpack_from(">8I", data, offset)
+        dt_size, dt_offset, entry_id, revision, *custom = values
+        # mkdtimg stores the table entries and their FDT payloads back to back.
+        # page_size is DT table metadata for consumers; it is not padding
+        # between individual payloads.
+        expected_offset = previous_end
+        if dt_offset != expected_offset:
+            raise RuntimeError(
+                f"dtbo.img entry {index} offset mismatch: "
+                f"expected {expected_offset}, got {dt_offset}"
+            )
+        if dt_offset + dt_size > len(data):
+            raise RuntimeError(f"dtbo.img entry {index} extends past the image")
+        expected_data = expected_image.read_bytes()
+        actual_data = data[dt_offset : dt_offset + dt_size]
+        validate_fdt_blob(actual_data, f"dtbo.img entry {index}")
+        if actual_data != expected_data:
+            raise RuntimeError(
+                f"dtbo.img entry {index} does not match {expected_image.name}"
+            )
+        expected_metadata = (
+            variant.get("id", 0),
+            variant.get("rev", 0),
+            *variant.get("custom", [0, 0, 0, 0]),
+        )
+        if (entry_id, revision, *custom) != expected_metadata:
+            raise RuntimeError(
+                f"dtbo.img entry {index} metadata mismatch: "
+                f"expected {expected_metadata}, got {(entry_id, revision, *custom)}"
+            )
+        previous_end = dt_offset + dt_size
+    if previous_end != len(data):
+        raise RuntimeError(
+            f"dtbo.img has {len(data) - previous_end} unexpected trailing bytes"
+        )
+
+
+def package_dt_layout(
+    args, top, make, jobs, env, dts_root, layout, layout_digest
+):
+    """Assemble source DTBs and separated DTBOs from a device layout."""
+    if not args.dt_layout:
+        return
+    if args.dtb_base or args.dtb_overlay or args.dtbo_target:
+        raise ValueError(
+            "--dt-layout cannot be combined with legacy DTB lists or --dtbo-target"
+        )
+    if not args.dtb_output or not args.dtbo_output:
+        raise ValueError("--dt-layout requires --dtb-output and --dtbo-output")
+
+    verify_layout_unchanged(args.dt_layout, layout_digest)
+    tools = build_overlay_tools(top, args, make, jobs, env)
+
+    dtb_dir = args.dtb_output.parent / "dtb"
+    if dtb_dir.exists():
+        shutil.rmtree(dtb_dir)
+    dtb_dir.mkdir(parents=True)
+    dtbs = {}
+    ordered_dtbs = []
+    for variant in layout["dtb_variants"]:
+        name = variant["name"]
+        base = resolve_layout_artifact(dts_root, variant.get("base"), ".dtb")
+        overlay_values = variant.get("overlays", [])
+        overlays = [
+            resolve_layout_artifact(dts_root, value, ".dtbo")
+            for value in overlay_values
+        ]
+        output = dtb_dir / name
+        if overlays:
+            run(
+                [
+                    str(tools["fdtoverlay"]),
+                    "-i",
+                    str(base),
+                    "-o",
+                    str(output),
+                    *(str(overlay) for overlay in overlays),
+                ],
+                env,
+            )
+        else:
+            shutil.copy2(base, output)
+        verify_dtb_semantics(tools["fdtget"], output, variant, env)
+        dtbs[name] = output
+        ordered_dtbs.append(output)
+
+    verify_dtb_selector_collisions(tools["fdtget"], dtbs, layout, env)
+
+    args.dtb_output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{args.dtb_output.name}.", dir=args.dtb_output.parent
+    )
+    dtb_temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as image:
+            for variant in ordered_dtbs:
+                with variant.open("rb") as source:
+                    shutil.copyfileobj(source, image)
+        if dtb_temporary.stat().st_size == 0:
+            raise RuntimeError("source DT layout produced an empty dtb.img")
+        verify_concatenated_dtbs(dtb_temporary, ordered_dtbs)
+        os.replace(dtb_temporary, args.dtb_output)
+    finally:
+        if dtb_temporary.exists():
+            dtb_temporary.unlink()
+
+    dtbo_dir = args.dtbo_output.parent / "dtbo"
+    validation_dir = dtbo_dir / ".validated"
+    if dtbo_dir.exists():
+        shutil.rmtree(dtbo_dir)
+    dtbo_dir.mkdir(parents=True)
+    ordered_dtbos = []
+    claimed_msm_ids = set()
+    for variant in layout["dtbo_variants"]:
+        metadata = parse_dtbo_metadata(variant)
+        name = variant["name"]
+        base = resolve_layout_artifact(dts_root, variant.get("base"), ".dtbo")
+        overlay_values = variant.get("overlays", [])
+        applies_to = variant.get("applies_to", [])
+        overlays = [
+            resolve_layout_artifact(dts_root, value, ".dtbo")
+            for value in overlay_values
+        ]
+        output = dtbo_dir / name
+        run(
+            [
+                str(tools["fdtoverlaymerge"]),
+                "-i",
+                str(base),
+                *(str(overlay) for overlay in overlays),
+                "-o",
+                str(output),
+            ],
+            env,
+        )
+        apply_root_properties(
+            tools["fdtput"],
+            tools["fdtget"],
+            output,
+            variant.get("root_properties"),
+            env,
+        )
+        verify_string_properties(
+            tools["fdtget"],
+            output,
+            "/",
+            variant.get("expected_root_strings"),
+            env,
+            f"DTBO variant {name} root",
+        )
+        actual_msm_ids = split_msm_ids(
+            read_cell_property(
+                tools["fdtget"], output, "qcom,msm-id", env
+            ),
+            f"DTBO variant {name}",
+        )
+        expected_msm_ids = set()
+        for dtb_name in applies_to:
+            expected_msm_ids.update(
+                split_msm_ids(
+                    read_cell_property(
+                        tools["fdtget"],
+                        dtbs[dtb_name],
+                        "qcom,msm-id",
+                        env,
+                    ),
+                    f"DTB variant {dtb_name}",
+                )
+            )
+        if actual_msm_ids != expected_msm_ids:
+            raise RuntimeError(
+                f"DTBO variant {name} selectors do not match applies_to: "
+                f"expected {sorted(expected_msm_ids)}, got {sorted(actual_msm_ids)}"
+            )
+        overlap = claimed_msm_ids.intersection(actual_msm_ids)
+        if overlap:
+            raise RuntimeError(
+                f"DTBO variant {name} reuses MSM selectors {sorted(overlap)}"
+            )
+        claimed_msm_ids.update(actual_msm_ids)
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        for dtb_name in applies_to:
+            run(
+                [
+                    str(tools["fdtoverlay"]),
+                    "-i",
+                    str(dtbs[dtb_name]),
+                    "-o",
+                    str(validation_dir / f"{name}-{dtb_name}"),
+                    str(output),
+                ],
+                env,
+            )
+        ordered_dtbos.append((variant, metadata, output))
+    if validation_dir.exists():
+        shutil.rmtree(validation_dir)
+
+    args.dtbo_output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{args.dtbo_output.name}.", dir=args.dtbo_output.parent
+    )
+    os.close(descriptor)
+    dtbo_temporary = pathlib.Path(temporary_name)
+    try:
+        mkdtimg = resolve_mkdtimg(top)
+        mkdtimg_command = [
+            str(mkdtimg),
+            "create",
+            str(dtbo_temporary),
+            f"--page_size={layout.get('page_size', 4096)}",
+            "--version=0",
+        ]
+        for _, metadata, image in ordered_dtbos:
+            mkdtimg_command.append(str(image))
+            mkdtimg_command.extend(metadata)
+        run(mkdtimg_command, env)
+        if not dtbo_temporary.is_file() or dtbo_temporary.stat().st_size == 0:
+            raise RuntimeError("source DT layout produced an empty dtbo.img")
+        if (
+            args.dtbo_max_size is not None
+            and dtbo_temporary.stat().st_size > args.dtbo_max_size
+        ):
+            raise RuntimeError(
+                "source-built DTBO image exceeds partition capacity: "
+                f"{dtbo_temporary.stat().st_size} > {args.dtbo_max_size}"
+            )
+        verify_dtbo_table(
+            dtbo_temporary,
+            layout,
+            [(variant, image) for variant, _, image in ordered_dtbos],
+        )
+        run([str(mkdtimg), "dump", str(dtbo_temporary)], env)
+        verify_layout_unchanged(args.dt_layout, layout_digest)
+        os.replace(dtbo_temporary, args.dtbo_output)
+    finally:
+        if dtbo_temporary.exists():
+            dtbo_temporary.unlink()
+
+
+def validate_source_dtb_tree(args, platform=None):
+    """Require Kbuild to see exactly the device-owned DTS tree."""
     source_root = args.dtb_source_root
     if source_root is None:
         source_root = (
-            platform
-            / "msm-kernel"
-            / "arch"
-            / args.arch
-            / "boot"
-            / "dts"
-            / "vendor"
+            args.source / "arch" / args.arch / "boot" / "dts" / "vendor"
         )
     source_root = source_root.resolve()
     required_files = [source_root / "Makefile", source_root / "qcom" / "Makefile"]
@@ -368,11 +1529,35 @@ def validate_source_dtb_tree(args, platform):
             "source DT tree is incomplete; refusing stock DT fallback: "
             + ", ".join(missing)
         )
+
+    compiled_root = (
+        args.source / "arch" / args.arch / "boot" / "dts" / "vendor"
+    )
+    if compiled_root.resolve() != source_root:
+        mode = "kernel platform" if platform is not None else "kernel"
+        raise RuntimeError(
+            f"{mode} DTS input does not resolve to the device-owned tree: "
+            f"{compiled_root} -> {compiled_root.resolve()}, expected {source_root}"
+        )
     return source_root
 
 
 def platform_dtb_root(args):
-    return args.out / "arch" / args.arch / "boot" / "dts" / "vendor"
+    if not args.platform_root:
+        raise RuntimeError("platform DT output requested without --platform-root")
+    try:
+        source_relative = args.source.relative_to(args.platform_root)
+    except ValueError as error:
+        raise ValueError("kernel source must be inside the kernel platform") from error
+    return (
+        args.out
+        / source_relative
+        / "arch"
+        / args.arch
+        / "boot"
+        / "dts"
+        / "vendor"
+    )
 
 
 def package_platform_dtb(args):
@@ -428,7 +1613,124 @@ def validate_platform_dtbo(args):
         )
 
 
-def build_kernel_platform(args, jobs, env):
+def remove_path(path):
+    if path is None:
+        return
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        raise RuntimeError(f"refusing to recursively delete file output path: {path}")
+
+
+def absolute_lexical_path(path):
+    """Make an output path absolute without resolving its final component."""
+    return pathlib.Path(os.path.abspath(os.fspath(path)))
+
+
+def validate_output_leaf(path, roots, context):
+    if path is None:
+        return
+    resolved_parent = path.parent.resolve()
+    if not any(
+        resolved_parent == root or root in resolved_parent.parents
+        for root in roots
+    ):
+        raise ValueError(f"{context} is outside Klee output roots: {path}")
+    if path.exists() and path.is_dir() and not path.is_symlink():
+        raise RuntimeError(f"{context} must be a file output, not a directory: {path}")
+
+
+def acquire_build_locks(roots):
+    """Serialize independent Klee builders that share out/dist trees."""
+    # Build execution is Linux-only; keep pure layout validation importable
+    # on other hosts so device authors can run the unit tests locally.
+    import fcntl
+
+    handles = []
+    lock_paths = {
+        root.parent / f".{root.name}.klee-build.lock" for root in roots
+    }
+    for lock_path in sorted(lock_paths, key=lambda path: str(path)):
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        print(f"Waiting for Klee kernel build lock: {lock_path}", flush=True)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        print(f"Acquired Klee kernel build lock: {lock_path}", flush=True)
+        handles.append(handle)
+    return handles
+
+
+def layout_artifact_paths(layout, dts_root):
+    """Return every Kbuild object named by a layout after validating paths."""
+    paths = []
+    for group, base_suffix in (("dtb_variants", ".dtb"), ("dtbo_variants", ".dtbo")):
+        for variant in layout[group]:
+            if not isinstance(variant, dict):
+                raise TypeError(f"each {group} entry must be an object")
+            values = [(variant.get("base"), base_suffix)]
+            overlays = variant.get("overlays", [])
+            values.extend((value, ".dtbo") for value in overlays)
+            for value, suffix in values:
+                relative = validate_posix_relative_path(
+                    value, suffix, "DT layout artifact"
+                )
+                paths.append(dts_root.joinpath(*relative.parts))
+    return sorted(set(paths))
+
+
+def bundle_outputs(args):
+    if args.platform_root or args.build_config:
+        image = args.dist / args.image
+    else:
+        image = args.out / "arch" / args.arch / "boot" / args.image
+    outputs = [image]
+    outputs.extend(args.dist / "modules" / name for name in args.required_module)
+    outputs.extend(path for path in (args.dtb_output, args.dtbo_output) if path)
+    if args.dtbo_target and not args.dtbo_output:
+        root = args.dist if args.platform_root else (
+            args.out / "arch" / args.arch / "boot"
+        )
+        outputs.append(root / args.dtbo_target)
+    return outputs
+
+
+def finalize_bundle(args, layout_digest=None):
+    """Validate all public outputs, refresh them, then publish the stamp."""
+    outputs = bundle_outputs(args)
+    missing = [str(path) for path in outputs if not path.is_file()]
+    empty = [str(path) for path in outputs if path.is_file() and path.stat().st_size == 0]
+    if missing:
+        raise RuntimeError("kernel bundle is missing outputs: " + ", ".join(missing))
+    if empty:
+        raise RuntimeError("kernel bundle has empty outputs: " + ", ".join(empty))
+    if layout_digest is not None:
+        verify_layout_unchanged(args.dt_layout, layout_digest)
+    # Every public output is removed before the build starts. Qualcomm's
+    # build.sh legitimately preserves source mtimes when it copies cached
+    # KERNEL_KIT files, and stage_kernel_modules intentionally does the same
+    # for .ko files. Existence here therefore proves publication by this
+    # invocation; comparing source mtimes to the invocation time would reject
+    # valid incremental builds. Give all public outputs one publication time
+    # only after the complete bundle has passed validation.
+    published_ns = time.time_ns()
+    for output in outputs:
+        os.utime(output, ns=(published_ns, published_ns))
+
+    if args.stamp:
+        args.stamp.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.stamp.with_name(args.stamp.name + f".tmp.{os.getpid()}")
+        payload = {
+            "version": 1,
+            "published_ns": published_ns,
+            "outputs": [str(path) for path in outputs],
+        }
+        temporary.write_text(
+            json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary, args.stamp)
+
+
+def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     if not args.platform_root or not args.build_config:
         raise RuntimeError(
             "--platform-root and --build-config must be specified together"
@@ -449,7 +1751,13 @@ def build_kernel_platform(args, jobs, env):
     if not build_script.is_file():
         raise FileNotFoundError(f"kernel platform builder not found: {build_script}")
 
-    if args.dtb_source_root or args.dtb_source_marker or args.dtb_base:
+    if args.dt_layout and not args.dt_layout.is_file():
+        raise FileNotFoundError("DT layout is missing: " + str(args.dt_layout))
+    if args.dt_layout and args.skip_platform_dtbo:
+        raise ValueError("an explicit DT layout requires platform DT overlay support")
+    if args.dt_layout and (not args.dtb_output or not args.dtbo_output):
+        raise ValueError("--dt-layout requires --dtb-output and --dtbo-output")
+    if args.dtb_source_root or args.dtb_source_marker or args.dtb_base or args.dt_layout:
         validate_source_dtb_tree(args, platform)
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -458,25 +1766,42 @@ def build_kernel_platform(args, jobs, env):
     # intentionally keep the kernel image and DT artifacts in one dist tree,
     # so an old DTBO can otherwise satisfy a target even when this invocation
     # did not compile the linked device DTS inputs.
-    stale_outputs = [args.dist / args.image, args.dist / "modules.list"]
+    stale_outputs = [
+        args.dist / args.image,
+        args.dist / ".config",
+        args.dist / "Module.symvers",
+        args.dist / "modules.list",
+        args.dtb_output,
+        args.dtbo_output,
+        args.stamp,
+    ]
     if args.dtbo_target:
         stale_outputs.append(args.dist / args.dtbo_target)
-    if args.dtb_output:
-        stale_outputs.append(args.dtb_output)
     stale_outputs.extend(args.dist.glob("*.ko"))
-    for output in stale_outputs:
-        if output.is_file() or output.is_symlink():
-            output.unlink()
+    for output in set(path for path in stale_outputs if path is not None):
+        remove_path(output)
     reset_module_install_tree(args.dist)
-    for relative in args.dtb_base + args.dtb_overlay:
-        generated = platform_dtb_root(args) / relative
-        if generated.is_file() or generated.is_symlink():
-            generated.unlink()
-    build_started_ns = time.time_ns()
+    dts_root = platform_dtb_root(args)
+    generated_dt_artifacts = [
+        dts_root / relative for relative in args.dtb_base + args.dtb_overlay
+    ]
+    if args.dt_layout:
+        generated_dt_artifacts.extend(
+            layout_artifact_paths(layout, dts_root)
+        )
+    for generated in set(generated_dt_artifacts):
+        remove_path(generated)
     platform_env = env.copy()
     platform_env["BUILD_CONFIG"] = build_config.as_posix()
     platform_env["OUT_DIR"] = str(args.out)
     platform_env["DIST_DIR"] = str(args.dist)
+    for inherited in (
+        "EXT_MODULES",
+        "SKIP_EXT_MODULES",
+        "DT_OVERLAY_SUPPORT",
+        "SKIP_VENDOR_BOOT",
+    ):
+        platform_env.pop(inherited, None)
     if args.external_module:
         if not args.external_module_root:
             raise RuntimeError("external modules require --external-module-root")
@@ -487,21 +1812,32 @@ def build_kernel_platform(args, jobs, env):
         # modules instead of attempting a second, incompatible Kbuild.
         external_modules = []
         for relative in args.external_module:
-            module = (args.external_module_root / relative).resolve()
+            module = args.external_module_root.joinpath(
+                *pathlib.PurePosixPath(relative).parts
+            )
             if not module.is_dir():
                 raise FileNotFoundError(
                     f"external module directory not found: {module}"
                 )
+            # Klee builds qcacld profiles explicitly below. Passing the
+            # Android.mk alias to build.sh would require a mutable directory
+            # that is intentionally absent from a clean source checkout.
+            # CVP/EVA likewise receive explicit module selectors in their
+            # wrappers, so build them after the platform transaction.
+            if module.name in ("qcacld-3.0", "cvp-kernel", "eva-kernel"):
+                continue
+            # Preserve the lexical path passed by the device for every other
+            # module so its Kbuild output remains deterministic.
             external_modules.append(
                 pathlib.PurePosixPath(
                     os.path.relpath(module, platform)
                 ).as_posix()
             )
         platform_env["EXT_MODULES"] = " ".join(external_modules)
-        # A stale shell environment must not silently suppress the requested
-        # source modules.
-        platform_env.pop("SKIP_EXT_MODULES", None)
+        reset_platform_external_outputs(args, platform)
         prepare_platform_external_output_alias(args, platform)
+    if args.dt_layout:
+        platform_env["DT_OVERLAY_SUPPORT"] = "1"
     if args.skip_platform_dtbo:
         platform_env["DT_OVERLAY_SUPPORT"] = "0"
         # Public Qualcomm kernel releases can omit the retail board DT
@@ -530,44 +1866,105 @@ def build_kernel_platform(args, jobs, env):
             "kernel platform did not produce a complete KERNEL_KIT: "
             + ", ".join(missing)
         )
-    # build.sh installs both in-tree and external modules in its staging
-    # directory and copies the resulting .ko files into DIST_DIR.  Android's
-    # Klee packaging graph consumes a stable basename-only directory, so
-    # normalize that output only after the platform build has completed.
-    reset_module_install_tree(args.dist)
-    stage_kernel_modules(args.dist)
-    validate_platform_dtbo(args)
-    package_platform_dtb(args)
-    generated_outputs = [args.dist / args.image]
-    if args.dtbo_target:
-        generated_outputs.append(args.dist / args.dtbo_target)
-    if args.dtb_output:
-        generated_outputs.append(args.dtb_output)
-    stale = [
-        str(path)
-        for path in generated_outputs
-        if path.is_file() and path.stat().st_mtime_ns < build_started_ns
+    # build.sh installs in-tree and ordinary external modules below
+    # DIST_DIR/lib/modules. Do not clear that directory here: it is the only
+    # publication source for those modules. Klee's staging pass below removes
+    # and recreates only DIST_DIR/modules, preserving the freshly installed
+    # tree while also incorporating the explicit qcacld variants.
+    special_modules = [
+        relative
+        for relative in args.external_module
+        if pathlib.PurePosixPath(relative).name in ("cvp-kernel", "eva-kernel")
     ]
-    if stale:
-        raise RuntimeError(
-            "platform build reused stale source artifacts: " + ", ".join(stale)
+    install_external_modules(args, make, jobs, env, special_modules)
+    build_qcacld_variants(args, make, jobs, env)
+    stage_kernel_modules(args.dist)
+    if args.dt_layout:
+        package_dt_layout(
+            args,
+            top,
+            make,
+            jobs,
+            env,
+            dts_root,
+            layout,
+            layout_digest,
         )
+    else:
+        validate_platform_dtbo(args)
+        package_platform_dtb(args)
+    finalize_bundle(args, layout_digest)
 
 
 def main():
     args = parse_args()
     top = pathlib.Path.cwd().resolve()
     args.source = args.source.resolve()
-    args.out = args.out.resolve()
-    args.dist = args.dist.resolve()
+    args.out = absolute_lexical_path(args.out)
+    args.dist = absolute_lexical_path(args.dist)
     if args.external_module_root:
         args.external_module_root = args.external_module_root.resolve()
     if args.dtb_output:
-        args.dtb_output = args.dtb_output.resolve()
+        args.dtb_output = absolute_lexical_path(args.dtb_output)
+    if args.dtbo_output:
+        args.dtbo_output = absolute_lexical_path(args.dtbo_output)
+    if args.dt_layout:
+        args.dt_layout = args.dt_layout.resolve()
     if args.dtb_source_root:
         args.dtb_source_root = args.dtb_source_root.resolve()
     if args.platform_root:
         args.platform_root = args.platform_root.resolve()
+    if args.stamp:
+        args.stamp = absolute_lexical_path(args.stamp)
+    if args.retained_provenance:
+        args.retained_provenance = args.retained_provenance.resolve()
+    if args.source_manifest:
+        args.source_manifest = args.source_manifest.resolve()
+
+    if len(set(args.required_module)) != len(args.required_module):
+        raise ValueError("required kernel module names must be unique")
+    for name in args.required_module:
+        path = pathlib.PurePosixPath(name)
+        if path.name != name or path.suffix != ".ko":
+            raise ValueError(f"invalid required kernel module basename: {name}")
+
+    if len(set(args.external_module)) != len(args.external_module):
+        raise ValueError("external kernel module paths must be unique")
+    for value in args.external_module:
+        path = pathlib.PurePosixPath(value)
+        if not value or path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"invalid external kernel module path: {value}")
+    if args.dtbo_target:
+        target = pathlib.PurePosixPath(args.dtbo_target)
+        if target.name != args.dtbo_target or target.suffix != ".img":
+            raise ValueError(f"invalid DTBO target name: {args.dtbo_target}")
+
+    validate_retained_provenance(args.retained_provenance, top)
+    validate_source_manifest(args.source_manifest, top)
+
+    layout = None
+    layout_digest = None
+    if args.dt_layout:
+        if not args.dt_layout.is_file():
+            raise FileNotFoundError("DT layout is missing: " + str(args.dt_layout))
+        layout, layout_digest = load_dt_layout(args.dt_layout)
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    args.dist.mkdir(parents=True, exist_ok=True)
+    output_roots = (args.out.resolve(), args.dist.resolve())
+    for output in bundle_outputs(args):
+        validate_output_leaf(output, output_roots, "kernel bundle output")
+    validate_output_leaf(args.stamp, output_roots, "kernel bundle stamp")
+
+    # Keep these handles alive until process exit. The operating system drops
+    # both flock locks on every success or exception path.
+    build_lock_handles = acquire_build_locks(output_roots)
+    if not build_lock_handles:
+        raise RuntimeError("failed to acquire Klee kernel output locks")
+    if args.stamp:
+        # The stamp is the transaction marker. Once a builder invocation has
+        # acquired exclusive ownership, no previous bundle may remain valid.
+        remove_path(args.stamp)
 
     host_tool_shims = create_host_tool_shims(args.out)
 
@@ -606,11 +2003,23 @@ def main():
             raise ValueError(
                 "kernel platform builds cannot use conventional config arguments"
             )
-        build_kernel_platform(args, jobs, env)
+        build_kernel_platform(
+            args, top, make, jobs, env, layout, layout_digest
+        )
         return
 
+    if args.dt_layout and not args.dt_layout.is_file():
+        raise FileNotFoundError("DT layout is missing: " + str(args.dt_layout))
+    if args.dtb_source_root or args.dtb_source_marker or args.dt_layout:
+        validate_source_dtb_tree(args)
     args.out.mkdir(parents=True, exist_ok=True)
     args.dist.mkdir(parents=True, exist_ok=True)
+    for output in set(bundle_outputs(args)):
+        remove_path(output)
+    dts_root = args.out / "arch" / args.arch / "boot" / "dts" / "vendor"
+    if layout:
+        for generated in layout_artifact_paths(layout, dts_root):
+            remove_path(generated)
     base_command = [
         str(make),
         "-C",
@@ -623,7 +2032,7 @@ def main():
 
     configure_kernel(args, make, base_command, env)
     targets = [args.image, "modules", "dtbs"]
-    if args.dtbo_target:
+    if args.dtbo_target and not args.dt_layout:
         targets.append(args.dtbo_target)
     run(base_command + targets, env)
     reset_module_install_tree(args.dist)
@@ -638,7 +2047,20 @@ def main():
     )
     install_external_modules(args, make, jobs, env)
     stage_kernel_modules(args.dist)
-    package_merged_dtb(args, env)
+    if args.dt_layout:
+        package_dt_layout(
+            args,
+            top,
+            make,
+            jobs,
+            env,
+            dts_root,
+            layout,
+            layout_digest,
+        )
+    else:
+        package_merged_dtb(args, env)
+    finalize_bundle(args, layout_digest)
 
 
 if __name__ == "__main__":

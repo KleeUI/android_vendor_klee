@@ -7,42 +7,67 @@
 ifeq ($(KLEE_BUILD_KERNEL_FROM_SOURCE),true)
 
 KLEE_KERNEL_BUILDER := vendor/klee/build/tools/build_kernel.py
+
+# Klee owns the complete source-kernel transaction. Follow links while
+# enumerating source trees and also retain the link paths and their resolved
+# targets. A retargeted device DTS or external-module link must invalidate the
+# bundle instead of silently reusing artifacts from the previous source tree.
+define klee-kernel-tracked-inputs
+$(sort \
+    $(shell find $(1) \( -type f -o -type l \) \
+        -not -path '*/.git/*' 2>/dev/null) \
+    $(shell find -L $(1) -type f \
+        -not -path '*/.git/*' 2>/dev/null) \
+    $(shell find -L $(1) -type f \
+        -not -path '*/.git/*' -exec realpath {} + 2>/dev/null) \
+    $(shell find $(1) -type l \
+        -not -path '*/.git/*' -exec realpath {} + 2>/dev/null))
+endef
+
 ifneq ($(KLEE_KERNEL_BUILD_CONFIG),)
 KLEE_KERNEL_CONFIG_INPUTS := \
     $(KLEE_KERNEL_PLATFORM_PATH)/$(KLEE_KERNEL_BUILD_CONFIG) \
     $(wildcard $(KLEE_KERNEL_PLATFORM_PATH)/common/build.config*)
 KLEE_KERNEL_SOURCE_INPUTS := \
-    $(sort \
-        $(shell find $(TARGET_KERNEL_SOURCE) -type f \
-            -not -path '*/.git/*' 2>/dev/null) \
-        $(shell find $(KLEE_KERNEL_PLATFORM_PATH)/build -type f \
-            -not -path '*/.git/*' 2>/dev/null) \
-        $(KLEE_KERNEL_CONFIG_INPUTS))
-ifneq ($(strip $(KLEE_SOURCE_DTB_REQUIRED)),)
-KLEE_KERNEL_SOURCE_INPUTS += \
-    $(sort $(shell find -L $(KLEE_KERNEL_SOURCE_DTB_ROOT) -type f \
-        -not -path '*/.git/*' 2>/dev/null))
-endif
+    $(call klee-kernel-tracked-inputs,$(TARGET_KERNEL_SOURCE)) \
+    $(call klee-kernel-tracked-inputs,$(KLEE_KERNEL_PLATFORM_PATH)/build) \
+    $(KLEE_KERNEL_CONFIG_INPUTS)
 else
 KLEE_KERNEL_CONFIG_INPUTS := $(foreach config,$(TARGET_KERNEL_CONFIG), \
     $(wildcard $(TARGET_KERNEL_SOURCE)/arch/$(KLEE_KERNEL_ARCH)/configs/$(config)))
 KLEE_KERNEL_CONFIG_INPUTS += $(TARGET_KERNEL_CONFIG_EXT)
 KLEE_KERNEL_SOURCE_INPUTS := \
-    $(TARGET_KERNEL_SOURCE)/Makefile \
+    $(call klee-kernel-tracked-inputs,$(TARGET_KERNEL_SOURCE)) \
     $(KLEE_KERNEL_CONFIG_INPUTS)
 endif
 
-# External Qualcomm modules are built as side effects of the kernel target.
-# Track their source files explicitly so an incremental build cannot reuse a
-# stale module merely because the core kernel image itself is unchanged.
+ifneq ($(strip $(KLEE_SOURCE_DTB_REQUIRED)),)
+KLEE_KERNEL_SOURCE_INPUTS += \
+    $(call klee-kernel-tracked-inputs,$(KLEE_KERNEL_SOURCE_DTB_ROOT))
+endif
+
+# External Qualcomm modules are part of the same kernel bundle. Track every
+# selected tree, including links and their real targets, so incremental builds
+# cannot publish a stale module beside a newly built Image.
 ifneq ($(strip $(TARGET_KERNEL_EXT_MODULE_ROOT)),)
 KLEE_KERNEL_EXTERNAL_MODULE_INPUTS := \
-    $(sort $(shell find \
-        $(foreach module,$(TARGET_KERNEL_EXT_MODULES), \
-            $(TARGET_KERNEL_EXT_MODULE_ROOT)/$(module)) \
-        -type f -not -path '*/.git/*' 2>/dev/null))
+    $(foreach module,$(TARGET_KERNEL_EXT_MODULES), \
+        $(call klee-kernel-tracked-inputs, \
+            $(TARGET_KERNEL_EXT_MODULE_ROOT)/$(module)))
 KLEE_KERNEL_SOURCE_INPUTS += $(KLEE_KERNEL_EXTERNAL_MODULE_INPUTS)
 endif
+
+ifneq ($(KLEE_KERNEL_DT_LAYOUT),)
+KLEE_KERNEL_DT_TOOL_INPUTS := \
+    $(call klee-kernel-tracked-inputs,kernel_platform/external/dtc) \
+    prebuilts/misc/linux-x86/libufdt/mkdtimg
+KLEE_KERNEL_SOURCE_INPUTS += \
+    $(KLEE_KERNEL_DT_LAYOUT) \
+    $(call klee-kernel-tracked-inputs,$(KLEE_KERNEL_DT_LAYOUT)) \
+    $(KLEE_KERNEL_DT_TOOL_INPUTS)
+endif
+
+KLEE_KERNEL_SOURCE_INPUTS := $(sort $(KLEE_KERNEL_SOURCE_INPUTS))
 
 KLEE_KERNEL_BUILD_ARGUMENTS := \
     --source $(TARGET_KERNEL_SOURCE) \
@@ -57,39 +82,13 @@ KLEE_KERNEL_BUILD_ARGUMENTS += \
     --platform-root $(KLEE_KERNEL_PLATFORM_PATH) \
     --build-config $(KLEE_KERNEL_BUILD_CONFIG) \
     $(foreach flag,$(TARGET_KERNEL_ADDITIONAL_FLAGS),--make-arg $(flag))
-ifneq ($(strip $(TARGET_KERNEL_EXT_MODULE_ROOT)),)
-KLEE_KERNEL_BUILD_ARGUMENTS += \
-    --external-module-root $(TARGET_KERNEL_EXT_MODULE_ROOT) \
-    $(foreach module,$(TARGET_KERNEL_EXT_MODULES),--external-module $(module))
-endif
-ifneq ($(strip $(TARGET_KERNEL_DTB_BASES)),)
-KLEE_KERNEL_BUILD_ARGUMENTS += \
-    $(foreach base,$(TARGET_KERNEL_DTB_BASES),--dtb-base $(base)) \
-    $(foreach overlay,$(TARGET_KERNEL_DTB_OVERLAYS),--dtb-overlay $(overlay)) \
-    --dtb-output $(KLEE_KERNEL_DTB_IMAGE)
-endif
-ifneq ($(strip $(KLEE_SOURCE_DTB_REQUIRED)),)
-KLEE_KERNEL_BUILD_ARGUMENTS += \
-    --dtb-source-root $(KLEE_KERNEL_SOURCE_DTB_ROOT) \
-    $(foreach marker,$(KLEE_KERNEL_DTB_SOURCE_MARKERS),--dtb-source-marker $(marker))
-endif
-ifeq ($(TARGET_NEEDS_DTBOIMAGE),true)
-ifeq ($(BOARD_PREBUILT_DTBOIMAGE),$(KLEE_KERNEL_DTBO_IMAGE))
-KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-target $(KLEE_KERNEL_DTBO_TARGET)
-ifneq ($(strip $(BOARD_DTBOIMG_PARTITION_SIZE)),)
-KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-max-size $(BOARD_DTBOIMG_PARTITION_SIZE)
-endif
-endif
-endif
-ifeq ($(KLEE_KERNEL_SKIP_PLATFORM_DTBO),true)
-KLEE_KERNEL_BUILD_ARGUMENTS += --skip-platform-dtbo
-endif
 else
 KLEE_KERNEL_UAPI_SOURCE := $(KLEE_KERNEL_OUT)/usr
 KLEE_KERNEL_BUILD_ARGUMENTS += \
     $(foreach config,$(TARGET_KERNEL_CONFIG),--config $(config)) \
     $(foreach config,$(TARGET_KERNEL_CONFIG_EXT),--config $(config)) \
     $(foreach flag,$(TARGET_KERNEL_ADDITIONAL_FLAGS),--make-arg $(flag))
+endif
 
 ifneq ($(strip $(TARGET_KERNEL_EXT_MODULE_ROOT)),)
 KLEE_KERNEL_BUILD_ARGUMENTS += \
@@ -97,7 +96,37 @@ KLEE_KERNEL_BUILD_ARGUMENTS += \
     $(foreach module,$(TARGET_KERNEL_EXT_MODULES),--external-module $(module))
 endif
 
+ifneq ($(strip $(CUPID_KERNEL_MODULE_PROVENANCE_FILE)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    --retained-provenance $(CUPID_KERNEL_MODULE_PROVENANCE_FILE)
+endif
+
+ifneq ($(strip $(CUPID_QUALCOMM_SOURCE_MANIFEST)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    --source-manifest $(CUPID_QUALCOMM_SOURCE_MANIFEST)
+endif
+
+ifneq ($(strip $(KLEE_SOURCE_DTB_REQUIRED)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    --dtb-source-root $(KLEE_KERNEL_SOURCE_DTB_ROOT) \
+    $(foreach marker,$(KLEE_KERNEL_DTB_SOURCE_MARKERS),--dtb-source-marker $(marker))
+endif
+
+KLEE_KERNEL_BUILDS_DTB :=
+KLEE_KERNEL_BUILDS_DTBO :=
+ifneq ($(KLEE_KERNEL_DT_LAYOUT),)
+KLEE_KERNEL_BUILDS_DTB := true
+KLEE_KERNEL_BUILDS_DTBO := true
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    --dt-layout $(KLEE_KERNEL_DT_LAYOUT) \
+    --dtb-output $(KLEE_KERNEL_DTB_IMAGE) \
+    --dtbo-output $(KLEE_KERNEL_DTBO_IMAGE)
+ifneq ($(strip $(BOARD_DTBOIMG_PARTITION_SIZE)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-max-size $(BOARD_DTBOIMG_PARTITION_SIZE)
+endif
+else
 ifneq ($(strip $(TARGET_KERNEL_DTB_BASES)),)
+KLEE_KERNEL_BUILDS_DTB := true
 KLEE_KERNEL_BUILD_ARGUMENTS += \
     $(foreach base,$(TARGET_KERNEL_DTB_BASES),--dtb-base $(base)) \
     $(foreach overlay,$(TARGET_KERNEL_DTB_OVERLAYS),--dtb-overlay $(overlay)) \
@@ -105,11 +134,8 @@ KLEE_KERNEL_BUILD_ARGUMENTS += \
 endif
 
 ifeq ($(TARGET_NEEDS_DTBOIMAGE),true)
-# Conventional kernel trees do not universally expose a make target named
-# dtbo.img. Only request it when this build owns the DTBO input; device trees
-# that deliberately retain an ABI-matched prebuilt DTBO must not invoke an
-# unsupported kernel make target.
 ifeq ($(BOARD_PREBUILT_DTBOIMAGE),$(KLEE_KERNEL_DTBO_IMAGE))
+KLEE_KERNEL_BUILDS_DTBO := true
 KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-target $(KLEE_KERNEL_DTBO_TARGET)
 ifneq ($(strip $(BOARD_DTBOIMG_PARTITION_SIZE)),)
 KLEE_KERNEL_BUILD_ARGUMENTS += --dtbo-max-size $(BOARD_DTBOIMG_PARTITION_SIZE)
@@ -118,7 +144,31 @@ endif
 endif
 endif
 
-$(KLEE_KERNEL_IMAGE): $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_SOURCE_INPUTS)
+ifeq ($(KLEE_KERNEL_SKIP_PLATFORM_DTBO),true)
+KLEE_KERNEL_BUILD_ARGUMENTS += --skip-platform-dtbo
+endif
+
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    $(foreach module,$(KLEE_KERNEL_MODULES),--required-module $(module)) \
+    --stamp $(KLEE_KERNEL_BUNDLE_STAMP)
+
+KLEE_KERNEL_BUNDLE_OUTPUTS := \
+    $(KLEE_KERNEL_IMAGE) \
+    $(KLEE_KERNEL_MODULE_PATHS)
+ifeq ($(KLEE_KERNEL_BUILDS_DTB),true)
+KLEE_KERNEL_BUNDLE_OUTPUTS += $(KLEE_KERNEL_DTB_IMAGE)
+endif
+ifeq ($(KLEE_KERNEL_BUILDS_DTBO),true)
+KLEE_KERNEL_BUNDLE_OUTPUTS += $(KLEE_KERNEL_DTBO_IMAGE)
+endif
+KLEE_KERNEL_BUNDLE_OUTPUTS := $(sort $(KLEE_KERNEL_BUNDLE_OUTPUTS))
+
+# build_kernel.py validates every declared output and publishes the stamp only
+# after the complete bundle is fresh. Kati therefore sees one producer for
+# Image, every requested module, dtb.img and dtbo.img; parallel packaging can
+# neither start a second kernel build nor consume a half-published dist tree.
+$(KLEE_KERNEL_BUNDLE_STAMP): .KATI_IMPLICIT_OUTPUTS := $(KLEE_KERNEL_BUNDLE_OUTPUTS)
+$(KLEE_KERNEL_BUNDLE_STAMP): $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_SOURCE_INPUTS)
 ifneq ($(KLEE_KERNEL_BUILD_CONFIG),)
 	@echo "Building Klee kernel platform from $(KLEE_KERNEL_BUILD_CONFIG)"
 else
@@ -128,16 +178,8 @@ endif
 	    LLVM_AOSP_PREBUILTS_VERSION="$(LLVM_AOSP_PREBUILTS_VERSION)" \
 	    python3 $(KLEE_KERNEL_BUILDER) $(KLEE_KERNEL_BUILD_ARGUMENTS)
 
-# Qualcomm's build/build.sh publishes kernel modules beside the image as
-# side effects. Register those files as make targets so image packaging can
-# depend on a clean kernel dist directory without requiring a second build.
-ifneq ($(strip $(KLEE_KERNEL_MODULE_PATHS)),)
-$(KLEE_KERNEL_MODULE_PATHS): $(KLEE_KERNEL_IMAGE)
-	@test -f "$@" || { echo "Missing generated kernel module: $@"; exit 1; }
-endif
-
 KLEE_LEGACY_KERNEL_UAPI := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
-$(KLEE_LEGACY_KERNEL_UAPI): $(KLEE_KERNEL_IMAGE)
+$(KLEE_LEGACY_KERNEL_UAPI): $(KLEE_KERNEL_BUNDLE_STAMP)
 	@echo "Installing Klee kernel UAPI headers: $@"
 	@test -d "$(KLEE_KERNEL_UAPI_SOURCE)" || { \
 	    echo "Missing generated kernel UAPI headers: $(KLEE_KERNEL_UAPI_SOURCE)"; \
@@ -153,25 +195,16 @@ $(INSTALLED_KERNEL_TARGET): $(KLEE_KERNEL_IMAGE)
 	$(copy-file-to-target)
 endif
 
-# A source-built conventional kernel may provide a device-specific merged DTB
-# image. Keep its dependency explicit so vendor_boot and recovery cannot pick
-# up a stale prebuilt DTB after the kernel configuration changes.
-ifneq ($(strip $(TARGET_KERNEL_DTB_BASES)),)
+# Keep the merged source DTB dependency explicit so vendor_boot and recovery
+# cannot package a stale image after the device layout changes.
+ifeq ($(KLEE_KERNEL_BUILDS_DTB),true)
 KLEE_INSTALLED_DTBIMAGE_TARGET := $(PRODUCT_OUT)/dtb.img
-$(KLEE_KERNEL_DTB_IMAGE): $(KLEE_KERNEL_IMAGE)
-	@test -f "$@" || { echo "Missing generated DTB image: $@"; exit 1; }
-
 $(KLEE_INSTALLED_DTBIMAGE_TARGET): $(KLEE_KERNEL_DTB_IMAGE)
 	@echo "Installing Klee DTB image: $@"
 	$(copy-file-to-target)
 endif
 
-ifeq ($(BOARD_PREBUILT_DTBOIMAGE),$(KLEE_KERNEL_DTBO_IMAGE))
-$(BOARD_PREBUILT_DTBOIMAGE): $(KLEE_KERNEL_IMAGE)
-	@test -f "$@" || { echo "Missing generated DTBO image: $@"; exit 1; }
-endif
-
 .PHONY: klee-kernel
-klee-kernel: $(KLEE_KERNEL_IMAGE)
+klee-kernel: $(KLEE_KERNEL_BUNDLE_STAMP)
 
 endif
