@@ -168,6 +168,18 @@ def install_external_modules(args, make, jobs, env):
         if not module.is_dir():
             raise FileNotFoundError(f"external module directory not found: {module}")
 
+        # The Android shell exports ANDROID_BUILD_TOP, but the standalone
+        # qcacld wrapper already passes an absolute WLAN_ROOT through
+        # M/KERNEL_SRC.  Its Kbuild rewrites WLAN_ROOT when ANDROID_BUILD_TOP
+        # is set, which turns that absolute path into an invalid
+        # ``../../..//home/...`` path.  Keep the platform environment intact
+        # for every other Qualcomm wrapper (some legacy audio Kbuild files
+        # still use ANDROID_BUILD_TOP), and isolate only qcacld.
+        module_env = env
+        if module.name == "qcacld-3.0":
+            module_env = env.copy()
+            module_env.pop("ANDROID_BUILD_TOP", None)
+
         # Qualcomm's module wrappers derive their source path from M. M must
         # remain relative to the kernel tree; an absolute value would turn
         # expressions such as $(KERNEL_SRC)/$(M) into an invalid path.
@@ -189,7 +201,7 @@ def install_external_modules(args, make, jobs, env):
         # Use each wrapper's default build target.  Qualcomm trees are not
         # uniform here: most expose `modules`, while datarmnet exposes only an
         # `all` target that delegates to the kernel's modules target.
-        run(command, env)
+        run(command, module_env)
         run(
             command
             + [
@@ -197,7 +209,7 @@ def install_external_modules(args, make, jobs, env):
                 f"INSTALL_MOD_PATH={args.dist.resolve()}",
                 "INSTALL_MOD_STRIP=1",
             ],
-            env,
+            module_env,
         )
 
 
