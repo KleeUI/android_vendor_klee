@@ -19,9 +19,10 @@ $(sort \
     $(shell find -L $(1) -type f \
         -not -path '*/.git/*' 2>/dev/null) \
     $(shell find -L $(1) -type f \
-        -not -path '*/.git/*' -exec realpath {} + 2>/dev/null) \
-    $(shell find $(1) -type l \
-        -not -path '*/.git/*' -exec realpath {} + 2>/dev/null))
+        -not -path '*/.git/*' -exec realpath -e {} + 2>/dev/null) \
+    $(shell find $(1) -type l -not -path '*/.git/*' \
+        -exec sh -c 'for link do realpath -e "$$link" 2>/dev/null; done' \
+        sh {} +))
 endef
 
 ifneq ($(KLEE_KERNEL_BUILD_CONFIG),)
