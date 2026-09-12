@@ -163,7 +163,9 @@ def configure_kernel(args, make, base_command, env):
         run(base_command + ["olddefconfig"], env)
 
 
-def install_external_modules(args, make, jobs, env, module_values=None):
+def install_external_modules(
+    args, make, jobs, env, module_values=None, kernel_output=None
+):
     modules = args.external_module if module_values is None else module_values
     if not modules:
         return
@@ -174,6 +176,7 @@ def install_external_modules(args, make, jobs, env, module_values=None):
         os.path.relpath(args.external_module_root, args.source)
     )
 
+    output_dir = args.out if kernel_output is None else kernel_output
     for relative in modules:
         module = args.external_module_root.joinpath(
             *pathlib.PurePosixPath(relative).parts
@@ -208,8 +211,8 @@ def install_external_modules(args, make, jobs, env, module_values=None):
             # Qualcomm wrappers locate sibling generated Module.symvers files
             # as $(OUT_DIR)/../sm8450-modules.  External Kbuild output mirrors
             # that layout beside the kernel output directory, not in source.
-            f"OUT_DIR={args.out.resolve()}",
-            f"O={args.out.resolve()}",
+            f"OUT_DIR={output_dir.resolve()}",
+            f"O={output_dir.resolve()}",
             f"ARCH={args.arch}",
         ]
         # CVP and EVA are separate Qualcomm source projects. Their Kbuild
@@ -415,7 +418,7 @@ def prepare_platform_external_output_alias(args, platform):
     # OUT_DIR/../sm8450-modules when locating a producer's Module.symvers.
     # Keep that compatibility path inside the same Klee output transaction;
     # it must never point at the checked-in source tree.
-    sibling_alias = args.out.parent / "sm8450-modules"
+    sibling_alias = args.out / "sm8450-modules"
     if sibling_alias.is_symlink():
         if sibling_alias.resolve() != actual_output:
             sibling_alias.unlink()
@@ -681,7 +684,14 @@ def validate_source_manifest(path, top, required_paths=()):
             )
         try:
             dirty = subprocess.check_output(
-                ["git", "-C", str(source), "status", "--porcelain"],
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=no",
+                ],
                 text=True,
                 stderr=subprocess.STDOUT,
             ).strip()
