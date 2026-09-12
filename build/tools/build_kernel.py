@@ -293,6 +293,28 @@ def external_module_symvers(
     return paths
 
 
+def write_symvers_bundle(destination, tables):
+    """Write one transaction-local Module.symvers input for wrapper makefiles.
+
+    Qualcomm's wrapper recipes expand ``KBUILD_EXTRA_SYMBOLS`` without shell
+    quoting.  A value containing several paths is consequently parsed as a
+    list of make targets by the recursive invocation.  Concatenating the
+    already-published tables into one file keeps the recursive interface
+    unambiguous while preserving the exact symbol records and their order.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as output:
+        for table in tables:
+            table = pathlib.Path(table)
+            if not table.is_file():
+                raise FileNotFoundError("Module.symvers input is missing: " + str(table))
+            data = table.read_bytes()
+            if data:
+                output.write(data)
+                if not data.endswith(b"\n"):
+                    output.write(b"\n")
+
+
 def write_platform_external_module_script(args, make, jobs, modules, kernel_output):
     """Create the Klee-owned external-module phase for a mixed platform build.
 
@@ -324,8 +346,14 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
 
     module_root_relative = pathlib.PurePosixPath(os.path.relpath(module_root, source))
     mixed_tree = (args.out / "gki_kernel" / "dist").resolve()
+    published_symbols_path = args.out / ".klee-published.symvers"
     # Keep the same compiler and product selectors as the platform transaction.
-    # KBUILD_EXTRA_SYMBOLS is intentionally supplied per command below.
+    # Qualcomm's wrapper makefiles expand KBUILD_EXTRA_SYMBOLS again in a
+    # recursive make recipe.  Passing several paths therefore causes the
+    # wrapper to turn every path after the first into a separate make target.
+    # Klee publishes one transaction-local aggregate table instead; one path
+    # survives both levels of make recursion and cannot accidentally resolve
+    # to a stale Xiaomi or Lineage output tree.
     make_args = [
         "LLVM=1",
         "LLVM_IAS=1",
@@ -338,19 +366,21 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
         if not str(value).startswith("KBUILD_EXTRA_SYMBOLS=")
     )
 
+    def quoted(value):
+        return shlex.quote(str(value))
+
     lines = [
         "#!/bin/bash",
         "set -euo pipefail",
         'staging="${1:?Klee external-module staging path is required}"',
         'mkdir -p "$staging"',
+        f"published_symbols={quoted(published_symbols_path)}",
+        ': > "$published_symbols"',
         "echo 'Klee external-module transaction: begin'",
     ]
     aliases = []
 
-    def quoted(value):
-        return shlex.quote(str(value))
-
-    def make_command(module, module_kernel_path, extras, symbols):
+    def make_command(module, module_kernel_path, extras):
         assignment = [
             quoted(make),
             f"-j{int(jobs)}",
@@ -372,9 +402,7 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
                 assignment.append('INSTALL_MOD_PATH="$staging"')
             else:
                 assignment.append(quoted(value))
-        assignment.append(
-            quoted("KBUILD_EXTRA_SYMBOLS=" + " ".join(str(value) for value in symbols))
-        )
+        assignment.append(quoted("KBUILD_EXTRA_SYMBOLS=" + str(published_symbols_path)))
         return " ".join(assignment)
 
     # Install aliases and cleanup before the first build so an interrupted
@@ -412,10 +440,6 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
                 ]
             )
 
-    # ``symbols`` is a static list of paths published by earlier transaction
-    # steps. Every path is guaranteed to exist before the command is reached;
-    # no future producer is ever placed in this list.
-    published = []
     for relative in modules:
         relative = pathlib.PurePosixPath(relative).as_posix()
         module = (module_root / pathlib.PurePosixPath(relative)).resolve()
@@ -456,7 +480,6 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
                         module,
                         variant_kernel_path,
                         extras,
-                        published,
                     )
                 )
                 lines.append(
@@ -468,7 +491,6 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
                             "INSTALL_MOD_PATH=\"$staging\"",
                             "INSTALL_MOD_STRIP=1",
                         ],
-                        published,
                     )
                     + " modules_install"
                 )
@@ -490,7 +512,7 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
 
         output_symvers = external_module_output_dir(args, relative, kernel_output)
         output_symvers.parent.mkdir(parents=True, exist_ok=True)
-        lines.append(make_command(module, module_kernel_path, extras, published))
+        lines.append(make_command(module, module_kernel_path, extras))
         lines.append(
             f"test -f {quoted(output_symvers / 'Module.symvers')} || {{ echo 'external module did not publish Module.symvers: {output_symvers / 'Module.symvers'}' >&2; exit 1; }}"
         )
@@ -499,11 +521,15 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
                 module,
                 module_kernel_path,
                 extras + ["INSTALL_MOD_PATH=\"$staging\"", "INSTALL_MOD_STRIP=1"],
-                published,
             )
             + " modules_install"
         )
-        published.append(output_symvers / "Module.symvers")
+        # Append only after the producer's build and install both succeeded.
+        # The next consumer then sees the complete set of tables published by
+        # this Klee transaction, while no future producer is exposed early.
+        lines.append(
+            f"cat {quoted(output_symvers / 'Module.symvers')} >> \"$published_symbols\""
+        )
 
     lines.extend(
         [
@@ -530,6 +556,8 @@ def install_external_modules(
 
     output_dir = args.out if kernel_output is None else kernel_output
     modules = order_external_modules(modules)
+    published_modules = []
+    published_symbols = output_dir / ".klee-published.symvers"
     for relative in modules:
         module = args.external_module_root.joinpath(
             *pathlib.PurePosixPath(relative).parts
@@ -576,20 +604,22 @@ def install_external_modules(
             command.append("CONFIG_MSM_CVP=m")
         elif module_real.name == "eva-kernel":
             command.append("CONFIG_MSM_EVA=m")
-        # Every external module consumes the platform KMI. Supplying the
-        # freshly generated symbol table also avoids stale sibling paths from
-        # older Xiaomi trees being selected by a wrapper.
-        symbol_tables = external_module_symvers(
-            args,
-            args.external_module,
-            output_dir,
-            existing_only=True,
-            include_kernel=not bool(args.platform_root),
+        # Every external module consumes the platform KMI and only the tables
+        # published by an earlier step in this transaction.  Keep them in one
+        # file because Qualcomm wrappers expand this variable again in a
+        # recursive make recipe and cannot safely carry a space-separated
+        # path list.
+        symbol_tables = []
+        if not args.platform_root:
+            kernel_symvers = (output_dir / "Module.symvers").resolve()
+            if kernel_symvers.is_file():
+                symbol_tables.append(kernel_symvers)
+        symbol_tables.extend(
+            external_module_output_dir(args, item, output_dir) / "Module.symvers"
+            for item in published_modules
         )
-        command.append(
-            "KBUILD_EXTRA_SYMBOLS="
-            + " ".join(str(path) for path in symbol_tables)
-        )
+        write_symvers_bundle(published_symbols, symbol_tables)
+        command.append("KBUILD_EXTRA_SYMBOLS=" + str(published_symbols.resolve()))
         # Use each wrapper's default build target.  Qualcomm trees are not
         # uniform here: most expose `modules`, while datarmnet exposes only an
         # `all` target that delegates to the kernel's modules target.
@@ -611,6 +641,7 @@ def install_external_modules(
             ],
             module_env,
         )
+        published_modules.append(relative)
 
 
 def reset_module_install_tree(dist):
@@ -682,6 +713,7 @@ def build_qcacld_variants(args, make, jobs, env):
     aliases = []
     variant_env = env.copy()
     variant_env.pop("ANDROID_BUILD_TOP", None)
+    published_symbols = kernel_output / ".klee-published.symvers"
     try:
         for profile in ("qca6490", "qca6750"):
             alias = qcacld / f".klee-{profile}"
@@ -709,12 +741,20 @@ def build_qcacld_variants(args, make, jobs, env):
             module_relative = kernel_relative / f".klee-{profile}"
             module_name = f"qca_cld3_{profile}"
             profile_upper = profile.upper()
-            # Keep the symbol-table list identical for both the build and the
-            # install pass.  Supplying it as a make command-line assignment
-            # is intentional: Qualcomm wrappers commonly provide a
+            # Keep one transaction-local symbol bundle for both the build and
+            # install pass.  Qualcomm wrappers commonly provide a
             # ``KBUILD_EXTRA_SYMBOLS ?= ...`` fallback, and an environment
             # value does not override that recursive make assignment in every
-            # wrapper.  A command-line variable does.
+            # wrapper.  A command-line variable with one path does, while a
+            # space-separated list would be split into recursive make targets.
+            symbol_tables = external_module_symvers(
+                args,
+                args.external_module,
+                kernel_output,
+                existing_only=True,
+                include_kernel=False,
+            )
+            write_symvers_bundle(published_symbols, symbol_tables)
             command = [
                 str(make),
                 f"-j{jobs}",
@@ -739,17 +779,7 @@ def build_qcacld_variants(args, make, jobs, env):
                 f"CONFIG_CNSS_{profile_upper}=y",
                 f"CONFIG_{profile_upper}_HEADERS_DEF=y",
                 "WLAN_CTRL_NAME=wlan",
-                "KBUILD_EXTRA_SYMBOLS="
-                + " ".join(
-                    str(path)
-                    for path in external_module_symvers(
-                        args,
-                        args.external_module,
-                        kernel_output,
-                        existing_only=True,
-                        include_kernel=False,
-                    )
-                ),
+                "KBUILD_EXTRA_SYMBOLS=" + str(published_symbols.resolve()),
             ]
             run(command, variant_env)
             run(
