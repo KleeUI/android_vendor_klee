@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -290,6 +291,228 @@ def external_module_symvers(
         if path not in paths:
             paths.append(path)
     return paths
+
+
+def write_platform_external_module_script(args, make, jobs, modules, kernel_output):
+    """Create the Klee-owned external-module phase for a mixed platform build.
+
+    ``kernel_platform/build.sh`` snapshots its make arguments once, before it
+    enters the external-module loop.  Qualcomm wrappers, however, publish
+    ``Module.symvers`` one module at a time.  Passing the complete future
+    symbol-table list therefore turns a dependency into a make prerequisite
+    for a file which does not exist yet.  The generated phase is run from
+    ``DIST_CMDS`` after the in-tree staging directory has been created.  It
+    builds and installs each selected module in Klee's topological order.  The
+    command for a consumer is emitted only after the preceding producer's
+    output path has been established, so every symbol input is present when
+    Kbuild evaluates its prerequisites.
+
+    The script is deliberately generated inside the transaction output tree:
+    it is not a checked-in compatibility wrapper and cannot resolve to an old
+    Xiaomi or Lineage output directory.
+    """
+    if not modules:
+        return None
+    if not args.external_module_root:
+        raise RuntimeError("external modules require --external-module-root")
+
+    module_root = args.external_module_root.resolve()
+    source = args.source.resolve()
+    kernel_output = kernel_output.resolve()
+    script = args.out / ".klee-external-modules.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+
+    module_root_relative = pathlib.PurePosixPath(os.path.relpath(module_root, source))
+    mixed_tree = (args.out / "gki_kernel" / "dist").resolve()
+    # Keep the same compiler and product selectors as the platform transaction.
+    # KBUILD_EXTRA_SYMBOLS is intentionally supplied per command below.
+    make_args = [
+        "LLVM=1",
+        "LLVM_IAS=1",
+        "DEPMOD=depmod",
+        "DTC=dtc",
+    ]
+    make_args.extend(
+        str(value)
+        for value in args.make_arg
+        if not str(value).startswith("KBUILD_EXTRA_SYMBOLS=")
+    )
+
+    lines = [
+        "#!/bin/bash",
+        "set -euo pipefail",
+        'staging="${1:?Klee external-module staging path is required}"',
+        'mkdir -p "$staging"',
+        "echo 'Klee external-module transaction: begin'",
+    ]
+    aliases = []
+
+    def quoted(value):
+        return shlex.quote(str(value))
+
+    def make_command(module, module_kernel_path, extras, symbols):
+        assignment = [
+            quoted(make),
+            f"-j{int(jobs)}",
+            "-C",
+            quoted(module),
+            f"M={quoted(module_kernel_path)}",
+            f"KERNEL_SRC={quoted(source)}",
+            f"OUT_DIR={quoted(kernel_output)}",
+            f"O={quoted(kernel_output)}",
+            f"ARCH={quoted(args.arch)}",
+        ]
+        assignment.extend(quoted(value) for value in make_args)
+        assignment.append(f"KBUILD_MIXED_TREE={quoted(mixed_tree)}")
+        for value in extras:
+            # ``staging`` is a variable owned by build.sh.  Keep that one
+            # assignment double-quoted so the parent shell expands it before
+            # invoking make; ordinary assignments are immutable literals.
+            if value == 'INSTALL_MOD_PATH="$staging"':
+                assignment.append('INSTALL_MOD_PATH="$staging"')
+            else:
+                assignment.append(quoted(value))
+        assignment.append(
+            quoted("KBUILD_EXTRA_SYMBOLS=" + " ".join(str(value) for value in symbols))
+        )
+        return " ".join(assignment)
+
+    # Install aliases and cleanup before the first build so an interrupted
+    # transaction cannot leave a temporary qcacld alias in the source tree.
+    for value in modules:
+        candidate = (module_root / pathlib.PurePosixPath(value)).resolve()
+        if candidate.name != "qcacld-3.0":
+            continue
+        for profile in ("qca6490", "qca6750"):
+            aliases.append((candidate / f".klee-{profile}", candidate))
+    if aliases:
+        lines.append("klee_created_qcacld_aliases=()")
+        lines.append("klee_cleanup_qcacld_aliases() {")
+        lines.extend(
+            [
+                "  for alias in \"${klee_created_qcacld_aliases[@]}\"; do",
+                '    rm -f "$alias"',
+                "  done",
+            ]
+        )
+        lines.extend(["}", "trap klee_cleanup_qcacld_aliases EXIT"])
+
+        for alias, target in aliases:
+            lines.extend(
+                [
+                    f"if [[ -L {quoted(alias)} ]]; then",
+                    f"  test \"$(readlink -f {quoted(alias)})\" = {quoted(target)} || {{ echo 'refusing qcacld alias: {alias}' >&2; exit 1; }}",
+                    f"elif [[ ! -e {quoted(alias)} ]]; then",
+                    f"  ln -s {quoted(target)} {quoted(alias)}",
+                    f"  klee_created_qcacld_aliases+=( {quoted(alias)} )",
+                    "else",
+                    f"  echo 'refusing to replace qcacld path: {alias}' >&2",
+                    "  exit 1",
+                    "fi",
+                ]
+            )
+
+    # ``symbols`` is a static list of paths published by earlier transaction
+    # steps. Every path is guaranteed to exist before the command is reached;
+    # no future producer is ever placed in this list.
+    published = []
+    for relative in modules:
+        relative = pathlib.PurePosixPath(relative).as_posix()
+        module = (module_root / pathlib.PurePosixPath(relative)).resolve()
+        if not module.is_dir():
+            raise FileNotFoundError(f"external module directory not found: {module}")
+        module_kernel_path = (module_root_relative / relative).as_posix()
+        module_name = module.name
+        lines.append(f"echo 'Klee external module: {relative}'")
+
+        if module_name == "qcacld-3.0":
+            # The WLAN source exposes two profiles through the same Kbuild
+            # tree.  Keep the aliases ephemeral and verify any pre-existing
+            # alias before using it.
+            for profile in ("qca6490", "qca6750"):
+                alias = module / f".klee-{profile}"
+                variant_kernel_path = f"{module_kernel_path}/.klee-{profile}"
+                variant_output = kernel_output / pathlib.PurePosixPath(variant_kernel_path)
+                profile_upper = profile.upper()
+                extras = [
+                    f"WLAN_ROOT={module}",
+                    "WLAN_COMMON_ROOT=cmn",
+                    f"WLAN_COMMON_INC={module / 'cmn'}",
+                    f"WLAN_FW_API={module.parent / 'fw-api'}",
+                    f"WLAN_PROFILE={profile}",
+                    f"CONFIG_QCA_CLD_WLAN_PROFILE={profile}",
+                    f"MODNAME=qca_cld3_{profile}",
+                    f"DEVNAME={profile}",
+                    "CONFIG_QCA_CLD_WLAN=m",
+                    "CONFIG_QCA_WIFI_ISOC=0",
+                    "CONFIG_QCA_WIFI_2_0=1",
+                    f"CONFIG_CNSS_{profile_upper}=y",
+                    f"CONFIG_{profile_upper}_HEADERS_DEF=y",
+                    "WLAN_CTRL_NAME=wlan",
+                ]
+                lines.append(f"mkdir -p {quoted(variant_output)}")
+                lines.append(
+                    make_command(
+                        module,
+                        variant_kernel_path,
+                        extras,
+                        published,
+                    )
+                )
+                lines.append(
+                    make_command(
+                        module,
+                        variant_kernel_path,
+                        extras
+                        + [
+                            "INSTALL_MOD_PATH=\"$staging\"",
+                            "INSTALL_MOD_STRIP=1",
+                        ],
+                        published,
+                    )
+                    + " modules_install"
+                )
+                # WLAN profiles do not provide symbols consumed by another
+                # selected module.  Verify their publication if present, but
+                # keep them out of the consumer list because their output path
+                # is intentionally profile-private.
+                variant_symvers = variant_output / "Module.symvers"
+                lines.append(
+                    f"test -f {quoted(variant_symvers)} || {{ echo 'qcacld profile did not publish Module.symvers: {variant_symvers}' >&2; exit 1; }}"
+                )
+            continue
+
+        extras = []
+        if module_name == "cvp-kernel":
+            extras.append("CONFIG_MSM_CVP=m")
+        elif module_name == "eva-kernel":
+            extras.append("CONFIG_MSM_EVA=m")
+
+        output_symvers = external_module_output_dir(args, relative, kernel_output)
+        output_symvers.parent.mkdir(parents=True, exist_ok=True)
+        lines.append(make_command(module, module_kernel_path, extras, published))
+        lines.append(
+            f"test -f {quoted(output_symvers / 'Module.symvers')} || {{ echo 'external module did not publish Module.symvers: {output_symvers / 'Module.symvers'}' >&2; exit 1; }}"
+        )
+        lines.append(
+            make_command(
+                module,
+                module_kernel_path,
+                extras + ["INSTALL_MOD_PATH=\"$staging\"", "INSTALL_MOD_STRIP=1"],
+                published,
+            )
+            + " modules_install"
+        )
+        published.append(output_symvers / "Module.symvers")
+
+    lines.extend(
+        [
+            "echo 'Klee external-module transaction: complete'",
+        ]
+    )
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    script.chmod(0o755)
+    return script
 
 
 def install_external_modules(
@@ -2054,10 +2277,14 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
         if not args.external_module_root:
             raise RuntimeError("external modules require --external-module-root")
 
-        # kernel_platform/build.sh owns the platform output layout.  Passing
-        # EXT_MODULES to it keeps external modules on the exact same
-        # .config, Module.symvers, compiler and staging path as the in-tree
-        # modules instead of attempting a second, incompatible Kbuild.
+        # Keep build.sh responsible for the kernel, DTB and base staging
+        # transaction, but do not hand it a frozen list of future
+        # Module.symvers files.  Kbuild treats that list as a dependency set;
+        # a producer which has not run yet consequently becomes a hard
+        # ``No rule to make target .../Module.symvers`` failure.  Klee runs
+        # the external phase from DIST_CMDS instead, where its own topological
+        # transaction can publish one symbol table before exposing it to the
+        # next consumer.
         external_modules = []
         for relative in ordered_external_modules:
             module = args.external_module_root.joinpath(
@@ -2067,45 +2294,43 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
                 raise FileNotFoundError(
                     f"external module directory not found: {module}"
                 )
-            # Klee builds qcacld profiles explicitly below. Passing the
-            # Android.mk alias to build.sh would require a mutable directory
-            # that is intentionally absent from a clean source checkout.
-            # CVP/EVA likewise receive explicit module selectors in their
-            # wrappers, so build them after the platform transaction.
-            if module.name in ("qcacld-3.0", "cvp-kernel", "eva-kernel"):
-                continue
-            # Preserve the lexical path passed by the device for every other
-            # module so its Kbuild output remains deterministic.
+            # Preserve the lexical path passed by the device so Klee's
+            # staging copy remains deterministic.  SKIP_EXT_MODULES below
+            # prevents build.sh from invoking any wrapper itself; EXT_MODULES
+            # is retained solely so create_modules_staging includes the
+            # ``extra`` tree populated by Klee's phase.
             external_modules.append(
                 pathlib.PurePosixPath(
                     os.path.relpath(module, platform)
                 ).as_posix()
             )
         platform_env["EXT_MODULES"] = " ".join(external_modules)
-        # build.sh forwards one immutable MAKE_ARGS list to every external
-        # module. Klee supplies the selected transaction's output paths; the
-        # kernel modpost wildcard ignores a path until its producer has
-        # published the table, while the topological order guarantees that a
-        # required producer exists before its consumer is reached. No source
-        # tree or unselected product Module.symvers path is imported.
+        platform_env["SKIP_EXT_MODULES"] = "1"
         kernel_output = args.out / args.source.relative_to(platform)
-        transaction_modules = [
-            relative
-            for relative in ordered_external_modules
-            if pathlib.PurePosixPath(relative).name
-            not in ("cvp-kernel", "eva-kernel")
-        ]
-        platform_env["KBUILD_EXTRA_SYMBOLS"] = " ".join(
-            str(path)
-            for path in external_module_symvers(
-                args,
-                transaction_modules,
-                kernel_output,
-                include_kernel=False,
-            )
-        )
         reset_platform_external_outputs(args, platform)
         prepare_platform_external_output_alias(args, platform)
+        external_script = write_platform_external_module_script(
+            args,
+            make,
+            jobs,
+            ordered_external_modules,
+            kernel_output,
+        )
+        if external_script is not None:
+            # build.config.msm.common appends prepare_vendor_dlkm to
+            # DIST_CMDS. Prefixing our command here makes the freshly
+            # installed external modules visible to both initramfs and
+            # vendor_dlkm image creation without modifying the platform
+            # builder or importing an upstream product rule.
+            module_phase = (
+                f"{shlex.quote(str(external_script))} \"$MODULES_STAGING_DIR\""
+            )
+            inherited_dist = platform_env.get("DIST_CMDS", "").strip()
+            platform_env["DIST_CMDS"] = (
+                f"{inherited_dist} && {module_phase}"
+                if inherited_dist
+                else module_phase
+            )
     if args.dt_layout:
         platform_env["DT_OVERLAY_SUPPORT"] = "1"
     if args.skip_platform_dtbo:
@@ -2119,31 +2344,14 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     if "printf" not in host_tools:
         host_tools.append("printf")
     platform_env["ADDITIONAL_HOST_TOOLS"] = " ".join(host_tools)
-    # ``build.sh`` snapshots positional arguments into MAKE_ARGS and forwards
-    # that immutable list to every Qualcomm external-module wrapper.  The
-    # environment assignment above is useful to child tooling, but cannot
-    # reliably replace a wrapper's ``?=`` fallback.  Pass the transaction's
-    # absolute, output-only symbol list as an explicit make argument so every
-    # producer/consumer sees the same Klee-owned tables and never falls back
-    # to stale Xiaomi output paths.
+    # Never pass KBUILD_EXTRA_SYMBOLS to the platform kernel invocation.  The
+    # mixed build receives the GKI symbol universe through KBUILD_MIXED_TREE;
+    # Klee's generated external phase adds only tables which already exist.
     platform_make_args = [
         str(value)
         for value in args.make_arg
         if not str(value).startswith("KBUILD_EXTRA_SYMBOLS=")
     ]
-    if args.external_module:
-        platform_make_args.append(
-            "KBUILD_EXTRA_SYMBOLS="
-            + " ".join(
-                str(path)
-                for path in external_module_symvers(
-                    args,
-                    transaction_modules,
-                    kernel_output,
-                    include_kernel=False,
-                )
-            )
-        )
     run(
         [str(build_script), f"-j{jobs}", *platform_make_args],
         platform_env,
@@ -2161,25 +2369,10 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
             "kernel platform did not produce a complete KERNEL_KIT: "
             + ", ".join(missing)
         )
-    # build.sh installs in-tree and ordinary external modules below
-    # DIST_DIR/lib/modules. Do not clear that directory here: it is the only
-    # publication source for those modules. Klee's staging pass below removes
-    # and recreates only DIST_DIR/modules, preserving the freshly installed
-    # tree while also incorporating the explicit qcacld variants.
-    special_modules = [
-        relative
-        for relative in ordered_external_modules
-        if pathlib.PurePosixPath(relative).name in ("cvp-kernel", "eva-kernel")
-    ]
-    install_external_modules(
-        args,
-        make,
-        jobs,
-        env,
-        special_modules,
-        args.out / args.source.relative_to(platform),
-    )
-    build_qcacld_variants(args, make, jobs, env)
+    # The generated DIST_CMDS phase has already installed every selected
+    # external module into build.sh's staging tree.  Do not invoke a second
+    # post-build Kbuild here: that would bypass the transaction symbol set and
+    # would leave vendor_dlkm out of sync with the modules it publishes.
     stage_kernel_modules(args.dist)
     if args.dt_layout:
         package_dt_layout(
