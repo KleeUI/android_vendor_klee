@@ -404,14 +404,16 @@ def prepare_platform_external_output_alias(args, platform):
     if not args.external_module_root:
         return
 
+    # ``args.out`` is the build.sh common output root.  build.sh derives the
+    # kernel output as ``COMMON_OUT_DIR/<kernel-dir>`` before appending the
+    # external module path, so mirror that exact lexical layout here.  This
+    # keeps the compatibility aliases inside the same Klee transaction and
+    # prevents wrappers from accidentally resolving to ``product/vendor``.
+    kernel_out = args.out / args.source.relative_to(platform)
     external_relative = pathlib.PurePosixPath(
         os.path.relpath(args.external_module_root, args.source)
     )
-    # build.sh treats ``args.out`` as COMMON_OUT_DIR and places kernel output
-    # in COMMON_OUT_DIR/msm-kernel. External output is still rooted at
-    # COMMON_OUT_DIR/<relpath(module, kernel source)>; calculate it from the
-    # common root so wrappers and cleanup agree with build.sh.
-    actual_output = (args.out / external_relative).resolve()
+    actual_output = (kernel_out / external_relative).resolve()
     alias = args.out / args.external_module_root.name
     actual_output.mkdir(parents=True, exist_ok=True)
     if alias.is_symlink():
@@ -450,14 +452,18 @@ def reset_platform_external_outputs(args, platform):
     """Remove only generated external-module output from the product tree."""
     # build.sh derives EXT_MOD_REL from the kernel source. With Qualcomm
     # projects living outside kernel_platform this places object files below
-    # the product output's vendor/ directory. Clear those exact derived paths
-    # so removed modules and old Module.symvers files cannot leak forward.
+    # the product output's obj/vendor/ directory. Clear those exact derived
+    # paths so removed modules and old Module.symvers files cannot leak
+    # forward.
     product_root = args.out.parent.parent.resolve()
+    kernel_out = args.out / args.source.relative_to(platform)
     for relative in args.external_module:
         module = args.external_module_root.joinpath(
             *pathlib.PurePosixPath(relative).parts
         ).resolve()
-        generated = (args.out / os.path.relpath(module, args.source)).resolve()
+        generated = (
+            kernel_out / os.path.relpath(module, args.source)
+        ).resolve()
         try:
             generated.relative_to(product_root)
         except ValueError as error:
