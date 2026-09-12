@@ -267,11 +267,20 @@ def external_module_output_dir(args, relative, output_dir):
     ).resolve()
 
 
-def external_module_symvers(args, modules, output_dir, existing_only=False):
-    """Return Klee-owned, output-only Module.symvers inputs in transaction order."""
+def external_module_symvers(
+    args, modules, output_dir, existing_only=False, include_kernel=True
+):
+    """Return output-only Module.symvers inputs in transaction order.
+
+    A mixed kernel build already makes the platform ``Module.symvers``
+    (including the GKI ``vmlinux.symvers``) the module-local ``Module.symvers``
+    input.  Repeating that same file in ``KBUILD_EXTRA_SYMBOLS`` makes modpost
+    see every vmlinux export twice.  Conventional, non-mixed builds still need
+    the explicit kernel table, so callers select that behavior explicitly.
+    """
     paths = []
     kernel_symvers = (output_dir / "Module.symvers").resolve()
-    if not existing_only or kernel_symvers.is_file():
+    if include_kernel and (not existing_only or kernel_symvers.is_file()):
         paths.append(kernel_symvers)
     for relative in order_external_modules(modules):
         path = external_module_output_dir(args, relative, output_dir) / "Module.symvers"
@@ -348,7 +357,11 @@ def install_external_modules(
         # freshly generated symbol table also avoids stale sibling paths from
         # older Xiaomi trees being selected by a wrapper.
         symbol_tables = external_module_symvers(
-            args, args.external_module, output_dir, existing_only=True
+            args,
+            args.external_module,
+            output_dir,
+            existing_only=True,
+            include_kernel=not bool(args.platform_root),
         )
         command.append(
             "KBUILD_EXTRA_SYMBOLS="
@@ -507,7 +520,11 @@ def build_qcacld_variants(args, make, jobs, env):
                 + " ".join(
                     str(path)
                     for path in external_module_symvers(
-                        args, args.external_module, kernel_output, existing_only=True
+                        args,
+                        args.external_module,
+                        kernel_output,
+                        existing_only=True,
+                        include_kernel=False,
                     )
                 ),
             ]
@@ -2081,7 +2098,10 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
         platform_env["KBUILD_EXTRA_SYMBOLS"] = " ".join(
             str(path)
             for path in external_module_symvers(
-                args, transaction_modules, kernel_output
+                args,
+                transaction_modules,
+                kernel_output,
+                include_kernel=False,
             )
         )
         reset_platform_external_outputs(args, platform)
@@ -2117,7 +2137,10 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
             + " ".join(
                 str(path)
                 for path in external_module_symvers(
-                    args, transaction_modules, kernel_output
+                    args,
+                    transaction_modules,
+                    kernel_output,
+                    include_kernel=False,
                 )
             )
         )
