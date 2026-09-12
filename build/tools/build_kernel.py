@@ -314,14 +314,29 @@ def build_qcacld_variants(args, make, jobs, env):
         os.path.relpath(qcacld, args.source)
     )
     aliases = []
+    variant_env = env.copy()
+    variant_env.pop("ANDROID_BUILD_TOP", None)
     try:
         for profile in ("qca6490", "qca6750"):
             alias = qcacld / f".klee-{profile}"
-            if alias.exists() or alias.is_symlink():
-                if not alias.is_symlink() or alias.resolve() != qcacld:
+            if alias.is_symlink():
+                try:
+                    alias_target = alias.resolve(strict=True)
+                except FileNotFoundError as error:
+                    raise RuntimeError(
+                        "refusing dangling qcacld alias: " + str(alias)
+                    ) from error
+                if alias_target != qcacld:
                     raise RuntimeError(
                         "refusing to replace existing qcacld alias: " + str(alias)
                     )
+                # A previous interrupted Klee build may have left the
+                # self-alias behind. It is still ours to clean up.
+                aliases.append(alias)
+            elif alias.exists():
+                raise RuntimeError(
+                    "refusing to replace existing qcacld path: " + str(alias)
+                )
             else:
                 alias.symlink_to(qcacld, target_is_directory=True)
                 aliases.append(alias)
@@ -350,11 +365,11 @@ def build_qcacld_variants(args, make, jobs, env):
                 "CONFIG_QCA_WIFI_ISOC=0",
                 "CONFIG_QCA_WIFI_2_0=1",
                 f"CONFIG_CNSS_{profile_upper}=y",
-                f"CONFIG_QCA{profile_upper}_HEADERS_DEF=y",
+                f"CONFIG_{profile_upper}_HEADERS_DEF=y",
                 "WLAN_CTRL_NAME=wlan",
                 f"KBUILD_EXTRA_SYMBOLS={args.out / 'Module.symvers'}",
             ]
-            run(command, env)
+            run(command, variant_env)
             run(
                 command
                 + [
@@ -362,7 +377,7 @@ def build_qcacld_variants(args, make, jobs, env):
                     f"INSTALL_MOD_PATH={args.dist.resolve()}",
                     "INSTALL_MOD_STRIP=1",
                 ],
-                env,
+                variant_env,
             )
     finally:
         for alias in aliases:
@@ -381,21 +396,37 @@ def prepare_platform_external_output_alias(args, platform):
     )
     actual_output = (kernel_out / external_relative).resolve()
     alias = args.out / args.external_module_root.name
-    if alias.resolve() == actual_output:
-        return
-
+    actual_output.mkdir(parents=True, exist_ok=True)
     if alias.is_symlink():
-        if alias.resolve() == actual_output:
-            return
-        alias.unlink()
+        if alias.resolve() != actual_output:
+            alias.unlink()
+            alias.symlink_to(os.path.relpath(actual_output, alias.parent))
     elif alias.exists():
         if alias.is_dir():
             shutil.rmtree(alias)
+            alias.symlink_to(os.path.relpath(actual_output, alias.parent))
         else:
             alias.unlink()
+            alias.symlink_to(os.path.relpath(actual_output, alias.parent))
+    else:
+        alias.symlink_to(os.path.relpath(actual_output, alias.parent))
 
-    actual_output.mkdir(parents=True, exist_ok=True)
-    alias.symlink_to(os.path.relpath(actual_output, alias.parent))
+    # Several Qualcomm wrappers use the historical sibling name below
+    # OUT_DIR/../sm8450-modules when locating a producer's Module.symvers.
+    # Keep that compatibility path inside the same Klee output transaction;
+    # it must never point at the checked-in source tree.
+    sibling_alias = args.out.parent / "sm8450-modules"
+    if sibling_alias.is_symlink():
+        if sibling_alias.resolve() != actual_output:
+            sibling_alias.unlink()
+        else:
+            pass
+    elif sibling_alias.exists():
+        raise RuntimeError(
+            "refusing to replace non-symlink module output alias: "
+            + str(sibling_alias)
+        )
+    sibling_alias.symlink_to(os.path.relpath(actual_output, sibling_alias.parent))
 
 
 def reset_platform_external_outputs(args, platform):
@@ -595,7 +626,7 @@ def validate_retained_provenance(path, top):
         seen.add(name)
 
 
-def validate_source_manifest(path, top):
+def validate_source_manifest(path, top, required_paths=()):
     """Require every declared Qualcomm source project to be at its pin."""
     if path is None:
         return
@@ -610,6 +641,7 @@ def validate_source_manifest(path, top):
     if not isinstance(projects, list) or not projects:
         raise ValueError("Qualcomm source manifest requires projects")
     seen = set()
+    declared_roots = set()
     for project in projects:
         if not isinstance(project, dict):
             raise TypeError("Qualcomm source manifest entries must be objects")
@@ -633,6 +665,7 @@ def validate_source_manifest(path, top):
             raise ValueError(f"source project escapes checkout: {relative}") from error
         if not source.is_dir():
             raise FileNotFoundError(f"Qualcomm source project is missing: {source}")
+        declared_roots.add(source)
         try:
             actual = subprocess.check_output(
                 ["git", "-C", str(source), "rev-parse", "HEAD"],
@@ -659,6 +692,16 @@ def validate_source_manifest(path, top):
                 f"Qualcomm source project is dirty; refusing generated-source reuse: {relative}"
             )
         seen.add(relative)
+    for required in required_paths:
+        source = pathlib.Path(required).resolve()
+        project_root = source
+        while project_root != top.resolve() and not (project_root / ".git").exists():
+            project_root = project_root.parent
+        if project_root not in declared_roots:
+            raise RuntimeError(
+                "Qualcomm source project is not pinned by the source manifest: "
+                + str(source)
+            )
 
 
 def verify_layout_unchanged(path, expected_digest):
@@ -1952,7 +1995,15 @@ def main():
             raise ValueError(f"invalid DTBO target name: {args.dtbo_target}")
 
     validate_retained_provenance(args.retained_provenance, top)
-    validate_source_manifest(args.source_manifest, top)
+    required_source_paths = []
+    if args.external_module_root:
+        required_source_paths = [
+            args.external_module_root.joinpath(
+                *pathlib.PurePosixPath(relative).parts
+            )
+            for relative in args.external_module
+        ]
+    validate_source_manifest(args.source_manifest, top, required_source_paths)
 
     layout = None
     layout_digest = None
