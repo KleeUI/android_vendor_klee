@@ -14,10 +14,10 @@ KLEE_KERNEL_BUILDER := vendor/klee/build/tools/build_kernel.py
 # bundle instead of silently reusing artifacts from the previous source tree.
 define klee-kernel-tracked-inputs
 $(sort \
-    $(shell find $(1) \( -type f -o -type l \) \
-        -not -path '*/.git/*' 2>/dev/null) \
     $(shell find -L $(1) -type f \
         -not -path '*/.git/*' 2>/dev/null) \
+    $(shell find $(1) -type l -not -path '*/.git/*' \
+        -exec test -e {} \; -print) \
     $(shell find -L $(1) -type f \
         -not -path '*/.git/*' -exec realpath -e {} + 2>/dev/null) \
     $(shell find $(1) -type l -not -path '*/.git/*' \
