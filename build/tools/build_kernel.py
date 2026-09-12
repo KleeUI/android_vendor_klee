@@ -163,6 +163,126 @@ def configure_kernel(args, make, base_command, env):
         run(base_command + ["olddefconfig"], env)
 
 
+# Klee owns the external-module transaction.  Qualcomm's individual wrapper
+# makefiles describe some of these relationships with Android-only
+# ``LOCAL_ADDITIONAL_DEPENDENCIES`` rules, but those rules are not available to
+# the standalone AOSP/Klee builder.  Keep the small, platform-neutral graph
+# here so a device's module list remains declarative and the build order is
+# deterministic.  The entries are intentionally Klee policy; they are not a
+# copy of an upstream product makefile.
+KLEE_EXTERNAL_MODULE_DEPENDENCIES = {
+    "camera-kernel": ("mmrm-driver",),
+    "cvp-kernel": ("mmrm-driver",),
+    "display-drivers/msm": ("mmrm-driver",),
+    "eva-kernel": ("mmrm-driver",),
+    "dataipa/drivers/platform/msm": ("datarmnet-ext/mem",),
+    "datarmnet/core": ("dataipa/drivers/platform/msm",),
+    "datarmnet-ext/aps": ("datarmnet/core",),
+    "datarmnet-ext/offload": ("datarmnet/core",),
+    "datarmnet-ext/shs": ("datarmnet/core",),
+    "datarmnet-ext/perf": ("datarmnet/core", "datarmnet-ext/shs"),
+    "datarmnet-ext/perf_tether": ("datarmnet/core",),
+    "datarmnet-ext/sch": ("datarmnet/core",),
+    "datarmnet-ext/wlan": ("datarmnet/core",),
+    "video-driver": ("mmrm-driver",),
+}
+
+
+def external_module_policy_key(relative):
+    """Map a module path to the Klee policy key, if one is known."""
+    value = pathlib.PurePosixPath(relative).as_posix()
+    for key in KLEE_EXTERNAL_MODULE_DEPENDENCIES:
+        if value == key or value.endswith("/" + key):
+            return key
+    return value
+
+
+def order_external_modules(modules):
+    """Return a stable topological order for the requested module paths.
+
+    Independent modules retain the order supplied by the device tree.  A
+    missing optional dependency is left untouched; this lets the same Klee
+    builder serve platforms which do not select a particular Qualcomm stack,
+    while selected producer/consumer pairs are always ordered correctly.
+    """
+    values = [pathlib.PurePosixPath(item).as_posix() for item in modules]
+    if len(values) < 2:
+        return values
+
+    positions = {value: index for index, value in enumerate(values)}
+    by_policy_key = {}
+    for value in values:
+        by_policy_key.setdefault(external_module_policy_key(value), []).append(value)
+
+    dependencies = {value: set() for value in values}
+    dependents = {value: set() for value in values}
+    indegree = {value: 0 for value in values}
+    for value in values:
+        policy_key = external_module_policy_key(value)
+        for dependency_key in KLEE_EXTERNAL_MODULE_DEPENDENCIES.get(policy_key, ()):
+            candidates = by_policy_key.get(dependency_key, ())
+            if not candidates:
+                continue
+            dependency = candidates[0]
+            if dependency == value or dependency in dependencies[value]:
+                continue
+            dependencies[value].add(dependency)
+            dependents[dependency].add(value)
+            indegree[value] += 1
+
+    ready = sorted(
+        (value for value, degree in indegree.items() if degree == 0),
+        key=positions.__getitem__,
+    )
+    ordered = []
+    while ready:
+        value = ready.pop(0)
+        ordered.append(value)
+        for dependent in sorted(dependents[value], key=positions.__getitem__):
+            indegree[dependent] -= 1
+            if indegree[dependent] == 0:
+                ready.append(dependent)
+        ready.sort(key=positions.__getitem__)
+
+    if len(ordered) != len(values):
+        cycle = [value for value, degree in indegree.items() if degree]
+        raise ValueError(
+            "cyclic Klee external-module dependency graph: " + ", ".join(cycle)
+        )
+    if ordered != values:
+        print(
+            "Klee external-module order: " + " ".join(ordered),
+            flush=True,
+        )
+    return ordered
+
+
+def external_module_output_dir(args, relative, output_dir):
+    """Return the output directory used by build.sh for one external module."""
+    module_root_relative_to_kernel = pathlib.PurePosixPath(
+        os.path.relpath(args.external_module_root, args.source)
+    )
+    return (
+        output_dir / module_root_relative_to_kernel / pathlib.PurePosixPath(relative)
+    ).resolve()
+
+
+def external_module_symvers(args, modules, output_dir, existing_only=False):
+    """Return Klee-owned, output-only Module.symvers inputs in transaction order."""
+    paths = []
+    kernel_symvers = (output_dir / "Module.symvers").resolve()
+    if not existing_only or kernel_symvers.is_file():
+        paths.append(kernel_symvers)
+    for relative in order_external_modules(modules):
+        path = external_module_output_dir(args, relative, output_dir) / "Module.symvers"
+        path = path.resolve()
+        if existing_only and not path.is_file():
+            continue
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
 def install_external_modules(
     args, make, jobs, env, module_values=None, kernel_output=None
 ):
@@ -177,6 +297,7 @@ def install_external_modules(
     )
 
     output_dir = args.out if kernel_output is None else kernel_output
+    modules = order_external_modules(modules)
     for relative in modules:
         module = args.external_module_root.joinpath(
             *pathlib.PurePosixPath(relative).parts
@@ -226,11 +347,8 @@ def install_external_modules(
         # Every external module consumes the platform KMI. Supplying the
         # freshly generated symbol table also avoids stale sibling paths from
         # older Xiaomi trees being selected by a wrapper.
-        symbol_tables = [args.out / "Module.symvers"]
-        symbol_tables.extend(
-            path
-            for path in args.out.rglob("Module.symvers")
-            if path != args.out / "Module.symvers"
+        symbol_tables = external_module_symvers(
+            args, args.external_module, output_dir, existing_only=True
         )
         command.append(
             "KBUILD_EXTRA_SYMBOLS="
@@ -240,6 +358,14 @@ def install_external_modules(
         # uniform here: most expose `modules`, while datarmnet exposes only an
         # `all` target that delegates to the kernel's modules target.
         run(command, module_env)
+        module_symvers = (
+            external_module_output_dir(args, relative, output_dir)
+            / "Module.symvers"
+        )
+        if not module_symvers.is_file():
+            raise RuntimeError(
+                "external module did not publish Module.symvers: " + str(module_symvers)
+            )
         run(
             command
             + [
@@ -1896,9 +2022,11 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     platform_env["BUILD_CONFIG"] = build_config.as_posix()
     platform_env["OUT_DIR"] = str(args.out)
     platform_env["DIST_DIR"] = str(args.dist)
+    ordered_external_modules = order_external_modules(args.external_module)
     for inherited in (
         "EXT_MODULES",
         "SKIP_EXT_MODULES",
+        "KBUILD_EXTRA_SYMBOLS",
         "DT_OVERLAY_SUPPORT",
         "SKIP_VENDOR_BOOT",
     ):
@@ -1912,7 +2040,7 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
         # .config, Module.symvers, compiler and staging path as the in-tree
         # modules instead of attempting a second, incompatible Kbuild.
         external_modules = []
-        for relative in args.external_module:
+        for relative in ordered_external_modules:
             module = args.external_module_root.joinpath(
                 *pathlib.PurePosixPath(relative).parts
             )
@@ -1935,6 +2063,25 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
                 ).as_posix()
             )
         platform_env["EXT_MODULES"] = " ".join(external_modules)
+        # build.sh forwards one immutable MAKE_ARGS list to every external
+        # module. Klee supplies the selected transaction's output paths; the
+        # kernel modpost wildcard ignores a path until its producer has
+        # published the table, while the topological order guarantees that a
+        # required producer exists before its consumer is reached. No source
+        # tree or unselected product Module.symvers path is imported.
+        kernel_output = args.out / args.source.relative_to(platform)
+        transaction_modules = [
+            relative
+            for relative in ordered_external_modules
+            if pathlib.PurePosixPath(relative).name
+            not in ("cvp-kernel", "eva-kernel")
+        ]
+        platform_env["KBUILD_EXTRA_SYMBOLS"] = " ".join(
+            str(path)
+            for path in external_module_symvers(
+                args, transaction_modules, kernel_output
+            )
+        )
         reset_platform_external_outputs(args, platform)
         prepare_platform_external_output_alias(args, platform)
     if args.dt_layout:
@@ -1974,7 +2121,7 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     # tree while also incorporating the explicit qcacld variants.
     special_modules = [
         relative
-        for relative in args.external_module
+        for relative in ordered_external_modules
         if pathlib.PurePosixPath(relative).name in ("cvp-kernel", "eva-kernel")
     ]
     install_external_modules(
