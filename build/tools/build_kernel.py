@@ -646,6 +646,18 @@ def validate_source_manifest(path, top):
                 f"Qualcomm source pin mismatch for {relative}: "
                 f"expected {revision}, got {actual}"
             )
+        try:
+            dirty = subprocess.check_output(
+                ["git", "-C", str(source), "status", "--porcelain"],
+                text=True,
+                stderr=subprocess.STDOUT,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise RuntimeError(f"cannot inspect source cleanliness: {source}") from error
+        if dirty:
+            raise RuntimeError(
+                f"Qualcomm source project is dirty; refusing generated-source reuse: {relative}"
+            )
         seen.add(relative)
 
 
