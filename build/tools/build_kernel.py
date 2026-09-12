@@ -473,6 +473,12 @@ def build_qcacld_variants(args, make, jobs, env):
             module_relative = kernel_relative / f".klee-{profile}"
             module_name = f"qca_cld3_{profile}"
             profile_upper = profile.upper()
+            # Keep the symbol-table list identical for both the build and the
+            # install pass.  Supplying it as a make command-line assignment
+            # is intentional: Qualcomm wrappers commonly provide a
+            # ``KBUILD_EXTRA_SYMBOLS ?= ...`` fallback, and an environment
+            # value does not override that recursive make assignment in every
+            # wrapper.  A command-line variable does.
             command = [
                 str(make),
                 f"-j{jobs}",
@@ -500,13 +506,9 @@ def build_qcacld_variants(args, make, jobs, env):
                 "KBUILD_EXTRA_SYMBOLS="
                 + " ".join(
                     str(path)
-                    for path in (
-                        kernel_output / "Module.symvers",
-                        args.out
-                        / "sm8450-modules"
-                        / "qcom/opensource/mmrm-driver/Module.symvers",
+                    for path in external_module_symvers(
+                        args, args.external_module, kernel_output, existing_only=True
                     )
-                    if path.is_file()
                 ),
             ]
             run(command, variant_env)
@@ -2097,8 +2099,30 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     if "printf" not in host_tools:
         host_tools.append("printf")
     platform_env["ADDITIONAL_HOST_TOOLS"] = " ".join(host_tools)
+    # ``build.sh`` snapshots positional arguments into MAKE_ARGS and forwards
+    # that immutable list to every Qualcomm external-module wrapper.  The
+    # environment assignment above is useful to child tooling, but cannot
+    # reliably replace a wrapper's ``?=`` fallback.  Pass the transaction's
+    # absolute, output-only symbol list as an explicit make argument so every
+    # producer/consumer sees the same Klee-owned tables and never falls back
+    # to stale Xiaomi output paths.
+    platform_make_args = [
+        str(value)
+        for value in args.make_arg
+        if not str(value).startswith("KBUILD_EXTRA_SYMBOLS=")
+    ]
+    if args.external_module:
+        platform_make_args.append(
+            "KBUILD_EXTRA_SYMBOLS="
+            + " ".join(
+                str(path)
+                for path in external_module_symvers(
+                    args, transaction_modules, kernel_output
+                )
+            )
+        )
     run(
-        [str(build_script), f"-j{jobs}", *args.make_arg],
+        [str(build_script), f"-j{jobs}", *platform_make_args],
         platform_env,
         cwd=platform,
     )
