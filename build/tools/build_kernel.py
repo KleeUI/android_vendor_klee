@@ -316,6 +316,7 @@ def build_qcacld_variants(args, make, jobs, env):
     kernel_relative = pathlib.PurePosixPath(
         os.path.relpath(qcacld, args.source)
     )
+    kernel_output = args.out / args.source.relative_to(args.platform_root)
     aliases = []
     variant_env = env.copy()
     variant_env.pop("ANDROID_BUILD_TOP", None)
@@ -353,8 +354,8 @@ def build_qcacld_variants(args, make, jobs, env):
                 str(qcacld),
                 f"M={module_relative.as_posix()}",
                 f"KERNEL_SRC={args.source.resolve()}",
-                f"OUT_DIR={args.out.resolve()}",
-                f"O={args.out.resolve()}",
+                f"OUT_DIR={kernel_output.resolve()}",
+                f"O={kernel_output.resolve()}",
                 f"ARCH={args.arch}",
                 f"WLAN_ROOT={qcacld}",
                 "WLAN_COMMON_ROOT=cmn",
@@ -370,7 +371,17 @@ def build_qcacld_variants(args, make, jobs, env):
                 f"CONFIG_CNSS_{profile_upper}=y",
                 f"CONFIG_{profile_upper}_HEADERS_DEF=y",
                 "WLAN_CTRL_NAME=wlan",
-                f"KBUILD_EXTRA_SYMBOLS={args.out / 'Module.symvers'}",
+                "KBUILD_EXTRA_SYMBOLS="
+                + " ".join(
+                    str(path)
+                    for path in (
+                        kernel_output / "Module.symvers",
+                        args.out
+                        / "sm8450-modules"
+                        / "qcom/opensource/mmrm-driver/Module.symvers",
+                    )
+                    if path.is_file()
+                ),
             ]
             run(command, variant_env)
             run(
@@ -393,11 +404,14 @@ def prepare_platform_external_output_alias(args, platform):
     if not args.external_module_root:
         return
 
-    kernel_out = args.out / args.source.relative_to(platform)
     external_relative = pathlib.PurePosixPath(
         os.path.relpath(args.external_module_root, args.source)
     )
-    actual_output = (kernel_out / external_relative).resolve()
+    # build.sh treats ``args.out`` as COMMON_OUT_DIR and places kernel output
+    # in COMMON_OUT_DIR/msm-kernel. External output is still rooted at
+    # COMMON_OUT_DIR/<relpath(module, kernel source)>; calculate it from the
+    # common root so wrappers and cleanup agree with build.sh.
+    actual_output = (args.out / external_relative).resolve()
     alias = args.out / args.external_module_root.name
     actual_output.mkdir(parents=True, exist_ok=True)
     if alias.is_symlink():
@@ -443,7 +457,7 @@ def reset_platform_external_outputs(args, platform):
         module = args.external_module_root.joinpath(
             *pathlib.PurePosixPath(relative).parts
         ).resolve()
-        generated = (args.out / os.path.relpath(module, platform)).resolve()
+        generated = (args.out / os.path.relpath(module, args.source)).resolve()
         try:
             generated.relative_to(product_root)
         except ValueError as error:
@@ -1941,7 +1955,14 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
         for relative in args.external_module
         if pathlib.PurePosixPath(relative).name in ("cvp-kernel", "eva-kernel")
     ]
-    install_external_modules(args, make, jobs, env, special_modules)
+    install_external_modules(
+        args,
+        make,
+        jobs,
+        env,
+        special_modules,
+        args.out / args.source.relative_to(platform),
+    )
     build_qcacld_variants(args, make, jobs, env)
     stage_kernel_modules(args.dist)
     if args.dt_layout:
