@@ -432,20 +432,25 @@ def prepare_platform_external_output_alias(args, platform):
 
     # Several Qualcomm wrappers use the historical sibling name below
     # OUT_DIR/../sm8450-modules when locating a producer's Module.symvers.
-    # Keep that compatibility path inside the same Klee output transaction;
-    # it must never point at the checked-in source tree.
+    # The suffix they append is ``qcom/opensource/<module>``.  Therefore the
+    # alias must point at the *obj/vendor* root, not at the already-qualified
+    # ``obj/vendor/qcom/opensource`` directory (which would duplicate that
+    # suffix and make the symbol dump appear missing).  Keep this
+    # compatibility path inside the same Klee output transaction; it must
+    # never point at the checked-in source tree.
     sibling_alias = args.out / "sm8450-modules"
+    sibling_root = (args.out.parent / "vendor").resolve()
+    sibling_root.mkdir(parents=True, exist_ok=True)
     if sibling_alias.is_symlink():
-        if sibling_alias.resolve() != actual_output:
+        if sibling_alias.resolve() != sibling_root:
             sibling_alias.unlink()
-        else:
-            pass
     elif sibling_alias.exists():
         raise RuntimeError(
             "refusing to replace non-symlink module output alias: "
             + str(sibling_alias)
         )
-    sibling_alias.symlink_to(os.path.relpath(actual_output, sibling_alias.parent))
+    if not sibling_alias.exists():
+        sibling_alias.symlink_to(os.path.relpath(sibling_root, sibling_alias.parent))
 
 
 def reset_platform_external_outputs(args, platform):
