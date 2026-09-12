@@ -1113,6 +1113,7 @@ def validate_dt_layout_schema(layout):
         "name",
         "base",
         "overlays",
+        "dtbo_required",
         "expected_root_properties",
         "expected_root_strings",
         "forbidden_root_properties",
@@ -1135,6 +1136,9 @@ def validate_dt_layout_schema(layout):
         validate_posix_relative_path(
             variant.get("base"), ".dtb", f"DTB variant {name} base"
         )
+        dtbo_required = variant.get("dtbo_required", True)
+        if not isinstance(dtbo_required, bool):
+            raise TypeError(f"DTB variant {name} dtbo_required must be boolean")
         overlays = validate_unique_string_list(
             variant.get("overlays", []), f"DTB variant {name} overlays"
         )
@@ -1222,8 +1226,15 @@ def validate_dt_layout_schema(layout):
                 )
             coverage[dtb_name].append(name)
 
+    required_names = {
+        variant["name"]
+        for variant in layout["dtb_variants"]
+        if variant.get("dtbo_required", True)
+    }
     invalid_coverage = {
-        name: owners for name, owners in coverage.items() if len(owners) != 1
+        name: owners
+        for name, owners in coverage.items()
+        if (len(owners) != 1 if name in required_names else len(owners) > 1)
     }
     if invalid_coverage:
         details = ", ".join(
