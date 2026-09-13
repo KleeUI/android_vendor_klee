@@ -382,7 +382,10 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
         f"platform_symbols={quoted(kernel_output / 'Module.symvers')}",
         "test -f \"$platform_symbols\" || { echo 'Klee platform Module.symvers is missing' >&2; exit 1; }",
         ': > "$published_symbols"',
-        'cat "$platform_symbols" > "$published_symbols"',
+        # KBUILD_MIXED_TREE already contributes vmlinux.symvers.  Keep only
+        # modular exports from the platform table here so modpost does not
+        # see every vmlinux export twice.
+        "awk '$3 != \"vmlinux\"' \"$platform_symbols\" > \"$published_symbols\"",
         "echo 'Klee external-module transaction: begin'",
     ]
     aliases = []
