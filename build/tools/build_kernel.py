@@ -174,7 +174,7 @@ def configure_kernel(args, make, base_command, env):
 KLEE_EXTERNAL_MODULE_DEPENDENCIES = {
     "camera-kernel": ("mmrm-driver",),
     "cvp-kernel": ("mmrm-driver",),
-    "display-drivers/msm": ("mmrm-driver",),
+    "display-drivers/msm": ("mmrm-driver", "mm-drivers/sync_fence"),
     "eva-kernel": ("mmrm-driver",),
     "dataipa/drivers/platform/msm": ("datarmnet-ext/mem",),
     "datarmnet/core": ("dataipa/drivers/platform/msm",),
