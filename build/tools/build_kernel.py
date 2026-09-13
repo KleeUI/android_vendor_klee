@@ -325,9 +325,12 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
     for a file which does not exist yet.  The generated phase is run from
     ``DIST_CMDS`` after the in-tree staging directory has been created.  It
     builds and installs each selected module in Klee's topological order.  The
-    command for a consumer is emitted only after the preceding producer's
-    output path has been established, so every symbol input is present when
-    Kbuild evaluates its prerequisites.
+    platform Module.symvers is published first so external modules can link
+    against modular symbols emitted by the source-built kernel (for example
+    the in-tree external-display provider).  The command for a consumer is
+    emitted only after the preceding producer's output path has been
+    established, so every symbol input is present when Kbuild evaluates its
+    prerequisites.
 
     The script is deliberately generated inside the transaction output tree:
     it is not a checked-in compatibility wrapper and cannot resolve to an old
@@ -353,7 +356,8 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
     # wrapper to turn every path after the first into a separate make target.
     # Klee publishes one transaction-local aggregate table instead; one path
     # survives both levels of make recursion and cannot accidentally resolve
-    # to a stale Xiaomi or Lineage output tree.
+    # to a stale Xiaomi or Lineage output tree.  Start it with the platform
+    # table so modular exports from the source-built kernel remain visible.
     make_args = [
         "LLVM=1",
         "LLVM_IAS=1",
@@ -375,7 +379,10 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
         'staging="${1:?Klee external-module staging path is required}"',
         'mkdir -p "$staging"',
         f"published_symbols={quoted(published_symbols_path)}",
+        f"platform_symbols={quoted(kernel_output / 'Module.symvers')}",
+        "test -f \"$platform_symbols\" || { echo 'Klee platform Module.symvers is missing' >&2; exit 1; }",
         ': > "$published_symbols"',
+        'cat "$platform_symbols" > "$published_symbols"',
         "echo 'Klee external-module transaction: begin'",
     ]
     aliases = []
