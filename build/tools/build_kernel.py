@@ -268,21 +268,15 @@ def external_module_output_dir(args, relative, output_dir):
     ).resolve()
 
 
-def external_module_symvers(
-    args, modules, output_dir, existing_only=False, include_kernel=True
-):
-    """Return output-only Module.symvers inputs in transaction order.
+def external_module_symvers(args, modules, output_dir, existing_only=False):
+    """Return earlier external-module symbol inputs in transaction order.
 
-    A mixed kernel build already makes the platform ``Module.symvers``
-    (including the GKI ``vmlinux.symvers``) the module-local ``Module.symvers``
-    input.  Repeating that same file in ``KBUILD_EXTRA_SYMBOLS`` makes modpost
-    see every vmlinux export twice.  Conventional, non-mixed builds still need
-    the explicit kernel table, so callers select that behavior explicitly.
+    Kbuild reads the canonical kernel ``Module.symvers`` from ``O=`` for every
+    external build.  ``KBUILD_EXTRA_SYMBOLS`` is therefore reserved strictly
+    for other external modules, independent of whether the kernel build is
+    mixed or conventional.
     """
     paths = []
-    kernel_symvers = (output_dir / "Module.symvers").resolve()
-    if include_kernel and (not existing_only or kernel_symvers.is_file()):
-        paths.append(kernel_symvers)
     for relative in order_external_modules(modules):
         path = external_module_output_dir(args, relative, output_dir) / "Module.symvers"
         path = path.resolve()
@@ -619,15 +613,10 @@ def install_external_modules(
         # file because Qualcomm wrappers expand this variable again in a
         # recursive make recipe and cannot safely carry a space-separated
         # path list.
-        symbol_tables = []
-        if not args.platform_root:
-            kernel_symvers = (output_dir / "Module.symvers").resolve()
-            if kernel_symvers.is_file():
-                symbol_tables.append(kernel_symvers)
-        symbol_tables.extend(
+        symbol_tables = [
             external_module_output_dir(args, item, output_dir) / "Module.symvers"
             for item in published_modules
-        )
+        ]
         write_symvers_bundle(published_symbols, symbol_tables)
         command.append("KBUILD_EXTRA_SYMBOLS=" + str(published_symbols.resolve()))
         # Use each wrapper's default build target.  Qualcomm trees are not
@@ -762,7 +751,6 @@ def build_qcacld_variants(args, make, jobs, env):
                 args.external_module,
                 kernel_output,
                 existing_only=True,
-                include_kernel=False,
             )
             write_symvers_bundle(published_symbols, symbol_tables)
             command = [
