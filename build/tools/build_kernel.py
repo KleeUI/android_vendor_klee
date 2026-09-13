@@ -330,7 +330,10 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
     the in-tree external-display provider).  The command for a consumer is
     emitted only after the preceding producer's output path has been
     established, so every symbol input is present when Kbuild evaluates its
-    prerequisites.
+    prerequisites.  Kbuild reads the platform ``Module.symvers`` directly
+    from the shared ``O=`` directory for every external-module invocation;
+    the transaction bundle therefore contains only earlier external-module
+    exports and never republishes platform symbols.
 
     The script is deliberately generated inside the transaction output tree:
     it is not a checked-in compatibility wrapper and cannot resolve to an old
@@ -356,8 +359,9 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
     # wrapper to turn every path after the first into a separate make target.
     # Klee publishes one transaction-local aggregate table instead; one path
     # survives both levels of make recursion and cannot accidentally resolve
-    # to a stale Xiaomi or Lineage output tree.  Start it with the platform
-    # table so modular exports from the source-built kernel remain visible.
+    # to a stale Xiaomi or Lineage output tree.  Kbuild already loads the
+    # source-built platform table from O=, so this aggregate starts empty and
+    # carries only producers completed earlier in this transaction.
     make_args = [
         "LLVM=1",
         "LLVM_IAS=1",
@@ -382,10 +386,6 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
         f"platform_symbols={quoted(kernel_output / 'Module.symvers')}",
         "test -f \"$platform_symbols\" || { echo 'Klee platform Module.symvers is missing' >&2; exit 1; }",
         ': > "$published_symbols"',
-        # KBUILD_MIXED_TREE already contributes vmlinux.symvers.  Keep only
-        # modular exports from the platform table here so modpost does not
-        # see every vmlinux export twice.
-        "awk '$3 != \"vmlinux\"' \"$platform_symbols\" > \"$published_symbols\"",
         "echo 'Klee external-module transaction: begin'",
     ]
     aliases = []
