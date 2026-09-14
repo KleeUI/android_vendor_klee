@@ -496,6 +496,13 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
                 profile_upper = profile.upper()
                 extras = [
                     f"WLAN_ROOT={module}",
+                    # The WLAN source carries the current CNSS ABI in the
+                    # tracked platform repository.  Do not let this
+                    # transaction fall back to the older in-tree
+                    # include/net/cnss2.h: the Waipio host driver requires
+                    # fw_build_id and WFC APIs provided by this header.
+                    "CONFIG_CNSS_OUT_OF_TREE=y",
+                    f"WLAN_PLATFORM_INC={module.parent / 'platform' / 'inc'}",
                     "WLAN_COMMON_ROOT=cmn",
                     f"WLAN_COMMON_INC={module / 'cmn'}",
                     f"WLAN_FW_API={module.parent / 'fw-api'}",
@@ -844,6 +851,12 @@ def build_qcacld_variants(args, make, jobs, env):
                 f"O={kernel_output.resolve()}",
                 f"ARCH={args.arch}",
                 f"WLAN_ROOT={qcacld}",
+                # Keep the CNSS header/API selection explicit for the
+                # standalone profile build.  The platform copy is the
+                # version paired with this qcacld source; the kernel's
+                # legacy include/net/cnss2.h lacks the Waipio WFC ABI.
+                "CONFIG_CNSS_OUT_OF_TREE=y",
+                f"WLAN_PLATFORM_INC={qcacld.parent / 'platform' / 'inc'}",
                 "WLAN_COMMON_ROOT=cmn",
                 f"WLAN_COMMON_INC={qcacld / 'cmn'}",
                 f"WLAN_FW_API={qcacld.parent / 'fw-api'}",
