@@ -757,17 +757,39 @@ def validate_exclusive_kernel_outputs(args, dist):
 
 
 def configure_external_spec_sync_provider(args, platform, platform_env):
-    """Keep the shared sync ABI enabled for consumers.
+    """Configure Klee's unique external Qualcomm provider set.
 
-    The display driver uses ``CONFIG_QCOM_SPEC_SYNC`` to expose the external
-    provider's wait API, so the platform config must not be disabled.  Klee
-    removes the legacy module from every staging tree immediately before
-    vendor_dlkm assembly; this hook is retained as the single place where
-    that policy is documented and can be consumed by the packaging phase.
+    ``CONFIG_QCOM_SPEC_SYNC`` stays enabled for the display driver's shared
+    wait ABI; its legacy module is removed during packaging.  The newer WLAN
+    platform similarly replaces the in-tree CNSS implementation.  Disable
+    only the latter in the outer msm-kernel defconfig (the nested GKI build
+    has ``KERNEL_DIR=common`` and skips the command), then let the external
+    platform Makefile build the required CNSS modules with its matching
+    headers and symbols.
     """
-    if "sync_fence.ko" not in selected_kernel_module_names(args):
+    selected_names = selected_kernel_module_names(args)
+    selected_paths = {
+        pathlib.PurePosixPath(value).as_posix()
+        for value in args.external_module
+    }
+    if "sync_fence.ko" in selected_names:
+        platform_env["KLEE_SPEC_SYNC_EXTERNAL_PROVIDER"] = "1"
+    if "wlan/platform" not in selected_paths:
         return
-    platform_env["KLEE_SPEC_SYNC_EXTERNAL_PROVIDER"] = "1"
+
+    disable_legacy_cnss = (
+        'if [ "$KERNEL_DIR" = "msm-kernel" ]; then '
+        '"$KERNEL_DIR/scripts/config" --file "$OUT_DIR/.config" '
+        "-d CNSS2 -d CNSS2_QMI -d CNSS_UTILS -d CNSS_GENL "
+        "-d WCNSS_MEM_PRE_ALLOC -d CNSS_PLAT_IPC_QMI_SVC "
+        "-d ICNSS2 -d ICNSS2_QMI -d ICNSS2_DEBUG; "
+        '(cd "$KERNEL_DIR" && make O="$OUT_DIR" olddefconfig); '
+        "fi"
+    )
+    prior = platform_env.get("POST_DEFCONFIG_CMDS", "").strip()
+    platform_env["POST_DEFCONFIG_CMDS"] = (
+        f"{prior} && {disable_legacy_cnss}" if prior else disable_legacy_cnss
+    )
 
 
 def build_qcacld_variants(args, make, jobs, env):
