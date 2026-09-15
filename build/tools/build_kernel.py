@@ -409,7 +409,13 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
     lines = [
         "#!/bin/bash",
         "set -euo pipefail",
-        'staging="${1:?Klee external-module staging path is required}"',
+        # build.sh creates DIST_CMDS before exporting MODULES_STAGING_DIR in
+        # the outer shell.  If eval consequently drops the empty quoted
+        # argument, derive the transaction-local staging directory from
+        # MODULES_STAGING_DIR or OUT_DIR instead of failing with $1 unset.
+        'if [ "$#" -gt 0 ]; then staging="$1"; '
+        'elif [ -n "${MODULES_STAGING_DIR:-}" ]; then staging="$MODULES_STAGING_DIR"; '
+        'else staging="$(dirname "${OUT_DIR:?}")/staging"; fi',
         'mkdir -p "$staging"',
         f"published_symbols={quoted(published_symbols_path)}",
         f"platform_symbols={quoted(kernel_output / 'Module.symvers')}",
