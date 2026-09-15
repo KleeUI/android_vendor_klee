@@ -203,6 +203,27 @@ def configure_kernel(args, make, base_command, env):
 # here so a device's module list remains declarative and the build order is
 # deterministic.  The entries are intentionally Klee policy; they are not a
 # copy of an upstream product makefile.
+# Standalone qcacld builds do not pass through Android.mk.  Mirror the
+# Qualcomm WLAN platform Makefile's external-config defaults explicitly so
+# the profile defconfig can derive its PCIe/IPCI bus and matching CNSS ABI.
+# These are build-interface selectors, not product policy; the device module
+# list still decides which profiles are packaged or loaded.
+KLEE_WLAN_PROFILE_PLATFORM_CONFIG = (
+    "CONFIG_CNSS2=m",
+    "CONFIG_CNSS2_QMI=y",
+    "CONFIG_CNSS2_DEBUG=y",
+    "CONFIG_CNSS_QMI_SVC=m",
+    "CONFIG_CNSS_PLAT_IPC_QMI_SVC=m",
+    "CONFIG_CNSS_GENL=m",
+    "CONFIG_WCNSS_MEM_PRE_ALLOC=m",
+    "CONFIG_CNSS_UTILS=m",
+    "CONFIG_CNSS2_SSR_DRIVER_DUMP=y",
+    "CONFIG_ICNSS2=m",
+    "CONFIG_ICNSS2_QMI=y",
+    "CONFIG_ICNSS2_DEBUG=y",
+)
+
+
 KLEE_EXTERNAL_MODULE_DEPENDENCIES = {
     "camera-kernel": ("mmrm-driver",),
     "cvp-kernel": ("mmrm-driver",),
@@ -516,6 +537,7 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
                     # include/net/cnss2.h: the Waipio host driver requires
                     # fw_build_id and WFC APIs provided by this header.
                     "CONFIG_CNSS_OUT_OF_TREE=y",
+                    *KLEE_WLAN_PROFILE_PLATFORM_CONFIG,
                     f"WLAN_PLATFORM_INC={module.parent / 'platform' / 'inc'}",
                     "WLAN_COMMON_ROOT=cmn",
                     f"WLAN_COMMON_INC={module / 'cmn'}",
@@ -972,6 +994,7 @@ def build_qcacld_variants(args, make, jobs, env):
                 # version paired with this qcacld source; the kernel's
                 # legacy include/net/cnss2.h lacks the Waipio WFC ABI.
                 "CONFIG_CNSS_OUT_OF_TREE=y",
+                *KLEE_WLAN_PROFILE_PLATFORM_CONFIG,
                 f"WLAN_PLATFORM_INC={qcacld.parent / 'platform' / 'inc'}",
                 "WLAN_COMMON_ROOT=cmn",
                 f"WLAN_COMMON_INC={qcacld / 'cmn'}",
