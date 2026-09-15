@@ -2497,9 +2497,17 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
                             "-path '*/kernel/drivers/net/wireless/cnss_genl/*.ko' "
                             "-delete; ",
                             "find \"$klee_root\" -type f "
+                            "-path '*/kernel/drivers/net/wireless/cnss_prealloc/*.ko' "
+                            "-delete; ",
+                            "find \"$klee_root\" -type f "
+                            "-path '*/kernel/drivers/soc/qcom/icnss2/*.ko' "
+                            "-delete; ",
+                            "find \"$klee_root\" -type f "
                             "\\( -name modules.order -o -name modules.builtin "
                             "-o -name modules.builtin.modinfo -o -name modules.load \\) "
-                            "-exec sed -i '/kernel\\/drivers\\/net\\/wireless\\/cnss/d' {} +; ",
+                            "-exec sed -i "
+                            "-e '/kernel\\/drivers\\/net\\/wireless\\/cnss/d' "
+                            "-e '/kernel\\/drivers\\/soc\\/qcom\\/icnss2/d' {} +; ",
                         ]
                     )
                 purge_commands.append("done")
