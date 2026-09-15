@@ -2449,7 +2449,12 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
             )
             dist_phases = [module_phase]
             selected_modules = selected_kernel_module_names(args)
-            if {"sync_fence.ko", "wlan/platform"}.intersection(selected_modules):
+            selected_external_paths = {
+                pathlib.PurePosixPath(value).as_posix()
+                for value in args.external_module
+            }
+            has_wlan_platform = "wlan/platform" in selected_external_paths
+            if "sync_fence.ko" in selected_modules or has_wlan_platform:
                 purge_roots = " ".join(
                     shlex.quote(str(root))
                     for root in (kernel_output, args.dist)
@@ -2475,7 +2480,7 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
                             "-exec sed -i '/qcom_sync_file\\.ko/d' {} +; ",
                         ]
                     )
-                if "wlan/platform" in selected_modules:
+                if has_wlan_platform:
                     # The newer out-of-tree WLAN platform intentionally
                     # replaces the legacy in-tree CNSS modules.  Remove only
                     # the kernel/ tree entries; the external copies live
