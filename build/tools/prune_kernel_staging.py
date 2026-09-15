@@ -59,6 +59,25 @@ def prune_directory(path: Path, allowed: set[str]) -> tuple[int, int]:
     return removed_modules, removed_metadata
 
 
+def invalidate_outputs(product_out: Path, names: list[str]) -> list[str]:
+    """Remove image outputs that embed the staged module directories.
+
+    The packaging rules consume directory contents, but the directory cleanup
+    itself is not a Ninja edge.  Removing an old module therefore does not
+    necessarily make an already-built image dirty.  Delete the affected image
+    outputs before Ninja starts so the current staging contract is always
+    reflected in the image.
+    """
+
+    removed: list[str] = []
+    for name in names:
+        output = product_out / name
+        if output.is_file() or output.is_symlink():
+            output.unlink()
+            removed.append(name)
+    return removed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--top", required=True, type=Path)
@@ -90,10 +109,16 @@ def main() -> int:
         removed_modules += modules
         removed_metadata += metadata
 
+    invalidated = invalidate_outputs(
+        args.product_out,
+        [str(name) for name in manifest.get("invalidate_outputs", [])],
+    )
+
     print(
         "KLEE_KERNEL_STAGING_PRUNE "
         f"allowed={len(allowed)} visited={visited} "
-        f"removed_modules={removed_modules} removed_metadata={removed_metadata}",
+        f"removed_modules={removed_modules} removed_metadata={removed_metadata} "
+        f"invalidated={','.join(invalidated) if invalidated else 'none'}",
         flush=True,
     )
     return 0
