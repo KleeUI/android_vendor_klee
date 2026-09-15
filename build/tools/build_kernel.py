@@ -409,13 +409,18 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
     lines = [
         "#!/bin/bash",
         "set -euo pipefail",
-        # build.sh creates DIST_CMDS before exporting MODULES_STAGING_DIR in
-        # the outer shell.  If eval consequently drops the empty quoted
-        # argument, derive the transaction-local staging directory from
-        # MODULES_STAGING_DIR or OUT_DIR instead of failing with $1 unset.
-        'if [ "$#" -gt 0 ]; then staging="$1"; '
+        # DIST_CMDS is evaluated by both the outer and nested mixed builds;
+        # keep all path resolution inside this script so shell expansion
+        # cannot drop an empty positional argument or a staging variable.
+        f"expected_out={quoted(kernel_output)}",
+        'current_out="$(readlink -m "${OUT_DIR:-/nonexistent}")"',
+        'if [ "$current_out" != "$expected_out" ]; then',
+        "  echo 'Klee external-module transaction: skip nested kernel output'",
+        "  exit 0",
+        "fi",
+        'if [ "$#" -gt 0 ] && [ -n "$1" ]; then staging="$1"; '
         'elif [ -n "${MODULES_STAGING_DIR:-}" ]; then staging="$MODULES_STAGING_DIR"; '
-        'else staging="$(dirname "${OUT_DIR:?}")/staging"; fi',
+        'else staging="$(dirname "$expected_out")/staging"; fi',
         'mkdir -p "$staging"',
         f"published_symbols={quoted(published_symbols_path)}",
         f"platform_symbols={quoted(kernel_output / 'Module.symvers')}",
@@ -582,6 +587,58 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
         lines.append(
             f"cat {quoted(output_symvers / 'Module.symvers')} >> \"$published_symbols\""
         )
+
+    # Remove legacy in-tree provider copies after every selected external
+    # module has installed, but before build.sh prepares initramfs/vendor_dlkm.
+    # The external platform and sync_fence implementations remain under
+    # their `extra/` paths and are the only runtime providers.
+    if any(
+        pathlib.PurePosixPath(value).as_posix() == "wlan/platform"
+        for value in modules
+    ) or "sync_fence.ko" in selected_kernel_module_names(args):
+        lines.extend(
+            [
+                "for klee_root in \"$expected_out\" \"$staging\" "
+                + quoted(args.dist.resolve())
+                + "; do",
+                '  [ -d "$klee_root" ] || continue',
+            ]
+        )
+        if "sync_fence.ko" in selected_kernel_module_names(args):
+            lines.extend(
+                [
+                    '  find "$klee_root" -type f -name qcom_sync_file.ko -delete',
+                    "  find \"$klee_root\" -type f "
+                    "\\( -name modules.order -o -name modules.builtin "
+                    "-o -name modules.builtin.modinfo -o -name modules.load \\) "
+                    "-exec sed -i '/qcom_sync_file\\.ko/d' {} +",
+                ]
+            )
+        if any(
+            pathlib.PurePosixPath(value).as_posix() == "wlan/platform"
+            for value in modules
+        ):
+            lines.extend(
+                [
+                    "  find \"$klee_root\" -type f "
+                    "-path '*/kernel/drivers/net/wireless/cnss2/*.ko' -delete",
+                    "  find \"$klee_root\" -type f "
+                    "-path '*/kernel/drivers/net/wireless/cnss_utils/*.ko' -delete",
+                    "  find \"$klee_root\" -type f "
+                    "-path '*/kernel/drivers/net/wireless/cnss_genl/*.ko' -delete",
+                    "  find \"$klee_root\" -type f "
+                    "-path '*/kernel/drivers/net/wireless/cnss_prealloc/*.ko' -delete",
+                    "  find \"$klee_root\" -type f "
+                    "-path '*/kernel/drivers/soc/qcom/icnss2/*.ko' -delete",
+                    "  find \"$klee_root\" -type f "
+                    "\\( -name modules.order -o -name modules.builtin "
+                    "-o -name modules.builtin.modinfo -o -name modules.load \\) "
+                    "-exec sed -i "
+                    "-e '/kernel\\/drivers\\/net\\/wireless\\/cnss/d' "
+                    "-e '/kernel\\/drivers\\/soc\\/qcom\\/icnss2/d' {} +",
+                ]
+            )
+        lines.append("done")
 
     lines.extend(
         [
@@ -783,19 +840,43 @@ def configure_external_spec_sync_provider(args, platform, platform_env):
     if "wlan/platform" not in selected_paths:
         return
 
-    disable_legacy_cnss = (
-        'if [ "$KERNEL_DIR" = "msm-kernel" ]; then '
-        '"$KERNEL_DIR/scripts/config" --file "$OUT_DIR/.config" '
+    # Source a generated fragment after Qualcomm's own config fragments so
+    # the command is appended to POST_DEFCONFIG_CMDS without embedding shell
+    # variables in DIST_CMDS.  The helper uses an absolute output path and
+    # exits for the nested GKI output, leaving only the outer msm-kernel
+    # provider disabled.
+    helper = args.out / ".klee-disable-legacy-cnss.sh"
+    helper.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        f"expected_out={shlex.quote(str(args.out / args.source.relative_to(args.platform_root)))}\n"
+        f"kernel_source={shlex.quote(str(args.source))}\n"
+        "current_out=\"$(readlink -m \"${OUT_DIR:-/nonexistent}\")\"\n"
+        "if [ \"$current_out\" != \"$expected_out\" ]; then exit 0; fi\n"
+        "\"$kernel_source/scripts/config\" --file \"$expected_out/.config\" "
         "-d CNSS2 -d CNSS2_QMI -d CNSS_UTILS -d CNSS_GENL "
         "-d WCNSS_MEM_PRE_ALLOC -d CNSS_PLAT_IPC_QMI_SVC "
-        "-d ICNSS2 -d ICNSS2_QMI -d ICNSS2_DEBUG; "
-        '(cd "$KERNEL_DIR" && make O="$OUT_DIR" olddefconfig); '
-        "fi"
+        "-d ICNSS2 -d ICNSS2_QMI -d ICNSS2_DEBUG\n"
+        "make -C \"$kernel_source\" O=\"$expected_out\" olddefconfig\n",
+        encoding="utf-8",
     )
-    prior = platform_env.get("POST_DEFCONFIG_CMDS", "").strip()
-    platform_env["POST_DEFCONFIG_CMDS"] = (
-        f"{prior} && {disable_legacy_cnss}" if prior else disable_legacy_cnss
+    helper.chmod(0o755)
+    fragment = args.out / ".klee-legacy-cnss.config"
+    relative_helper = pathlib.PurePosixPath(
+        os.path.relpath(helper, platform)
+    ).as_posix()
+    fragment.write_text(
+        "# Generated by Klee; disable legacy CNSS only in outer msm-kernel.\n"
+        f"append_cmd POST_DEFCONFIG_CMDS {shlex.quote(relative_helper)}\n",
+        encoding="utf-8",
     )
+    relative_fragment = pathlib.PurePosixPath(
+        os.path.relpath(fragment, platform)
+    ).as_posix()
+    fragments = platform_env.get("BUILD_CONFIG_FRAGMENTS", "").split()
+    if relative_fragment not in fragments:
+        fragments.append(relative_fragment)
+    platform_env["BUILD_CONFIG_FRAGMENTS"] = " ".join(fragments)
 
 
 def build_qcacld_variants(args, make, jobs, env):
@@ -2469,78 +2550,11 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
             kernel_output,
         )
         if external_script is not None:
-            # build.config.msm.common appends prepare_vendor_dlkm to
-            # DIST_CMDS. Run the external transaction first so its modules
-            # are visible to both initramfs and vendor_dlkm image creation.
-            module_phase = (
-                f"{shlex.quote(str(external_script))} \"$MODULES_STAGING_DIR\""
-            )
-            dist_phases = [module_phase]
-            selected_modules = selected_kernel_module_names(args)
-            selected_external_paths = {
-                pathlib.PurePosixPath(value).as_posix()
-                for value in args.external_module
-            }
-            has_wlan_platform = "wlan/platform" in selected_external_paths
-            if "sync_fence.ko" in selected_modules or has_wlan_platform:
-                purge_roots = " ".join(
-                    shlex.quote(str(root))
-                    for root in (kernel_output, args.dist)
-                )
-                purge_commands = [
-                    "for klee_root in "
-                    + purge_roots
-                    + " \"$MODULES_STAGING_DIR\"; do "
-                    "[ -d \"$klee_root\" ] || continue; "
-                ]
-                if "sync_fence.ko" in selected_modules:
-                    # The platform config keeps CONFIG_QCOM_SPEC_SYNC=m so
-                    # display-drivers sees the external wait API.  Its legacy
-                    # qcom_sync_file.ko must nevertheless be removed from
-                    # every runtime staging tree before module lists and
-                    # vendor_dlkm are generated.
-                    purge_commands.extend(
-                        [
-                            "find \"$klee_root\" -type f -name qcom_sync_file.ko -delete; ",
-                            "find \"$klee_root\" -type f "
-                            "\\( -name modules.order -o -name modules.builtin "
-                            "-o -name modules.builtin.modinfo -o -name modules.load \\) "
-                            "-exec sed -i '/qcom_sync_file\\.ko/d' {} +; ",
-                        ]
-                    )
-                if has_wlan_platform:
-                    # The newer out-of-tree WLAN platform intentionally
-                    # replaces the legacy in-tree CNSS modules.  Remove only
-                    # the kernel/ tree entries; the external copies live
-                    # under extra/ and remain available to qcacld consumers.
-                    purge_commands.extend(
-                        [
-                            "find \"$klee_root\" -type f "
-                            "-path '*/kernel/drivers/net/wireless/cnss2/*.ko' "
-                            "-delete; ",
-                            "find \"$klee_root\" -type f "
-                            "-path '*/kernel/drivers/net/wireless/cnss_utils/*.ko' "
-                            "-delete; ",
-                            "find \"$klee_root\" -type f "
-                            "-path '*/kernel/drivers/net/wireless/cnss_genl/*.ko' "
-                            "-delete; ",
-                            "find \"$klee_root\" -type f "
-                            "-path '*/kernel/drivers/net/wireless/cnss_prealloc/*.ko' "
-                            "-delete; ",
-                            "find \"$klee_root\" -type f "
-                            "-path '*/kernel/drivers/soc/qcom/icnss2/*.ko' "
-                            "-delete; ",
-                            "find \"$klee_root\" -type f "
-                            "\\( -name modules.order -o -name modules.builtin "
-                            "-o -name modules.builtin.modinfo -o -name modules.load \\) "
-                            "-exec sed -i "
-                            "-e '/kernel\\/drivers\\/net\\/wireless\\/cnss/d' "
-                            "-e '/kernel\\/drivers\\/soc\\/qcom\\/icnss2/d' {} +; ",
-                        ]
-                    )
-                purge_commands.append("done")
-                purge_phase = "".join(purge_commands)
-                dist_phases.append(purge_phase)
+            # build.sh appends prepare_vendor_dlkm to DIST_CMDS.  Keep the
+            # transaction invocation free of shell variables; the generated
+            # script resolves nested/outer staging and performs provider
+            # cleanup itself before returning.
+            dist_phases = [shlex.quote(str(external_script))]
             inherited_dist = platform_env.get("DIST_CMDS", "").strip()
             if inherited_dist:
                 dist_phases.append(inherited_dist)
