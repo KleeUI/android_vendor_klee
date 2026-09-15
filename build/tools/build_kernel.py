@@ -208,6 +208,9 @@ KLEE_EXTERNAL_MODULE_DEPENDENCIES = {
     "cvp-kernel": ("mmrm-driver",),
     "display-drivers/msm": ("mmrm-driver", "mm-drivers/sync_fence"),
     "eva-kernel": ("mmrm-driver",),
+    # qcacld consumes the current CNSS symbols (including WFC support) from
+    # the tracked out-of-tree WLAN platform provider.
+    "wlan/qcacld-3.0": ("wlan/platform",),
     "dataipa/drivers/platform/msm": ("datarmnet-ext/mem",),
     "datarmnet/core": ("dataipa/drivers/platform/msm",),
     "datarmnet-ext/aps": ("datarmnet/core",),
