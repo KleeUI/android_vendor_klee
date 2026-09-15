@@ -2448,28 +2448,57 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
                 f"{shlex.quote(str(external_script))} \"$MODULES_STAGING_DIR\""
             )
             dist_phases = [module_phase]
-            if "sync_fence.ko" in selected_kernel_module_names(args):
-                # The platform config keeps CONFIG_QCOM_SPEC_SYNC=m so
-                # display-drivers sees the external wait API.  Its legacy
-                # qcom_sync_file.ko must nevertheless be removed from every
-                # runtime staging tree before module lists and vendor_dlkm
-                # are generated; otherwise two drivers claim /dev/spec_sync.
+            selected_modules = selected_kernel_module_names(args)
+            if {"sync_fence.ko", "wlan/platform"}.intersection(selected_modules):
                 purge_roots = " ".join(
                     shlex.quote(str(root))
                     for root in (kernel_output, args.dist)
                 )
-                purge_phase = (
+                purge_commands = [
                     "for klee_root in "
                     + purge_roots
                     + " \"$MODULES_STAGING_DIR\"; do "
                     "[ -d \"$klee_root\" ] || continue; "
-                    "find \"$klee_root\" -type f -name qcom_sync_file.ko -delete; "
-                    "find \"$klee_root\" -type f "
-                    "\\( -name modules.order -o -name modules.builtin "
-                    "-o -name modules.builtin.modinfo -o -name modules.load \\) "
-                    "-exec sed -i '/qcom_sync_file\\.ko/d' {} +; "
-                    "done"
-                )
+                ]
+                if "sync_fence.ko" in selected_modules:
+                    # The platform config keeps CONFIG_QCOM_SPEC_SYNC=m so
+                    # display-drivers sees the external wait API.  Its legacy
+                    # qcom_sync_file.ko must nevertheless be removed from
+                    # every runtime staging tree before module lists and
+                    # vendor_dlkm are generated.
+                    purge_commands.extend(
+                        [
+                            "find \"$klee_root\" -type f -name qcom_sync_file.ko -delete; ",
+                            "find \"$klee_root\" -type f "
+                            "\\( -name modules.order -o -name modules.builtin "
+                            "-o -name modules.builtin.modinfo -o -name modules.load \\) "
+                            "-exec sed -i '/qcom_sync_file\\.ko/d' {} +; ",
+                        ]
+                    )
+                if "wlan/platform" in selected_modules:
+                    # The newer out-of-tree WLAN platform intentionally
+                    # replaces the legacy in-tree CNSS modules.  Remove only
+                    # the kernel/ tree entries; the external copies live
+                    # under extra/ and remain available to qcacld consumers.
+                    purge_commands.extend(
+                        [
+                            "find \"$klee_root\" -type f "
+                            "-path '*/kernel/drivers/net/wireless/cnss2/*.ko' "
+                            "-delete; ",
+                            "find \"$klee_root\" -type f "
+                            "-path '*/kernel/drivers/net/wireless/cnss_utils/*.ko' "
+                            "-delete; ",
+                            "find \"$klee_root\" -type f "
+                            "-path '*/kernel/drivers/net/wireless/cnss_genl/*.ko' "
+                            "-delete; ",
+                            "find \"$klee_root\" -type f "
+                            "\\( -name modules.order -o -name modules.builtin "
+                            "-o -name modules.builtin.modinfo -o -name modules.load \\) "
+                            "-exec sed -i '/kernel\\/drivers\\/net\\/wireless\\/cnss/d' {} +; ",
+                        ]
+                    )
+                purge_commands.append("done")
+                purge_phase = "".join(purge_commands)
                 dist_phases.append(purge_phase)
             inherited_dist = platform_env.get("DIST_CMDS", "").strip()
             if inherited_dist:
