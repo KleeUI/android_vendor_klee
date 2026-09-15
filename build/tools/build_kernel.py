@@ -519,6 +519,13 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
                     f"WLAN_PLATFORM_INC={module.parent / 'platform' / 'inc'}",
                     "WLAN_COMMON_ROOT=cmn",
                     f"WLAN_COMMON_INC={module / 'cmn'}",
+                    # hif_main.h includes multibus.h directly.  The shared
+                    # Kbuild only adds its dispatcher directory for a
+                    # CONFIG_HIF_* branch, which is not selected while Klee
+                    # parses the external profile.  Keep the paired host
+                    # common headers visible through the kernel command-line
+                    # flags without modifying the imported Qualcomm tree.
+                    f"KCFLAGS=-I{module / 'cmn' / 'hif' / 'src' / 'dispatcher'}",
                     f"WLAN_FW_API={module.parent / 'fw-api'}",
                     f"WLAN_PROFILE={profile}",
                     f"CONFIG_QCA_CLD_WLAN_PROFILE={profile}",
@@ -967,6 +974,10 @@ def build_qcacld_variants(args, make, jobs, env):
                 f"WLAN_PLATFORM_INC={qcacld.parent / 'platform' / 'inc'}",
                 "WLAN_COMMON_ROOT=cmn",
                 f"WLAN_COMMON_INC={qcacld / 'cmn'}",
+                # See the generated external transaction above: the shared
+                # dispatcher header is required even when no CONFIG_HIF_*
+                # branch is active during Kbuild parsing.
+                f"KCFLAGS=-I{qcacld / 'cmn' / 'hif' / 'src' / 'dispatcher'}",
                 f"WLAN_FW_API={qcacld.parent / 'fw-api'}",
                 f"WLAN_PROFILE={profile}",
                 f"CONFIG_QCA_CLD_WLAN_PROFILE={profile}",
