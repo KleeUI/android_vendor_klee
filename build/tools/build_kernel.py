@@ -1289,8 +1289,10 @@ def validate_retained_provenance(path, top):
     if not isinstance(data, dict) or data.get("version") != 1:
         raise ValueError("retained-module provenance must use version 1")
     entries = data.get("retained_prebuilt")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("retained-module provenance requires retained_prebuilt")
+    # An empty list is the explicit source-only contract.  Keep validating
+    # the field type so a missing/malformed manifest cannot disable checks.
+    if not isinstance(entries, list):
+        raise ValueError("retained-module provenance requires retained_prebuilt list")
     seen = set()
     for entry in entries:
         if not isinstance(entry, dict):
