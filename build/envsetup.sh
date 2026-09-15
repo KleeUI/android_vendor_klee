@@ -59,6 +59,28 @@ function m()
     KLEE_KERNEL_JOBS="$selected_jobs" command m "$@"
 }
 
+function klee_prune_kernel_staging()
+{
+    local top="${ANDROID_BUILD_TOP:-}"
+    local manifest
+    local product_out
+
+    # Only devices that publish a Klee module-staging contract need this
+    # cleanup.  Other products keep the common Android build behaviour.
+    if [[ -z "$top" || -z "$TARGET_PRODUCT" ]]; then
+        return 0
+    fi
+    manifest="$top/device/xiaomi/$TARGET_PRODUCT/configs/kernel-module-staging.json"
+    if [[ ! -f "$manifest" ]]; then
+        return 0
+    fi
+    product_out="$top/out/target/product/$TARGET_PRODUCT"
+    python3 "$top/vendor/klee/build/tools/prune_kernel_staging.py" \
+        --top "$top" \
+        --product-out "$product_out" \
+        --manifest "$manifest"
+}
+
 function klee_build()
 {
     local jobs="${KLEE_BUILD_JOBS:-}"
@@ -135,6 +157,11 @@ function klee_build()
 
     if [[ -n "$jobs" && -z "$has_explicit_jobs" ]]; then
         set -- -j"$jobs" "$@"
+    fi
+
+    if ! klee_prune_kernel_staging; then
+        echo "Klee kernel staging cleanup failed" 1>&2
+        return 1
     fi
 
     if [[ -n "${KLEE_SOONG_INCREMENTAL_ANALYSIS:-}" ]]; then
