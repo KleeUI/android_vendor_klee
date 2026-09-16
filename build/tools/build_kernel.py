@@ -1167,8 +1167,8 @@ def configure_cupid_source_module_configs(args, platform, platform_env):
     # Keep the two Klee-owned platform options from configs/klee_GKI.config
     # active when Qualcomm's production Waipio fragment is selected.
     config_args = " ".join(f"-m {symbol}" for symbol in symbols)
-    config_args += " -y QCOM_DMABUF_HEAPS_SYSTEM_UNCACHED"
-    config_args += " -y FW_LOADER_USER_HELPER_FALLBACK"
+    config_args += " -e QCOM_DMABUF_HEAPS_SYSTEM_UNCACHED"
+    config_args += " -e FW_LOADER_USER_HELPER_FALLBACK"
     helper.write_text(
         "#!/bin/bash\n"
         "set -euo pipefail\n"
