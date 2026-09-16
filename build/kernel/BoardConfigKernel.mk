@@ -18,6 +18,10 @@ KLEE_KERNEL_OUT ?= $(PRODUCT_OUT)/obj/KLEE_KERNEL
 KLEE_KERNEL_DIST ?= $(PRODUCT_OUT)/obj/KLEE_KERNEL_DIST
 KLEE_KERNEL_PLATFORM_PATH ?= $(TARGET_KERNEL_PLATFORM_PATH)
 KLEE_KERNEL_BUILD_CONFIG := $(strip $(TARGET_KERNEL_BUILD_CONFIG))
+# Mixed GKI/vendor builds must expose one UTS_RELEASE to the boot Image and
+# every loadable module.  Products may override this with a reviewed suffix;
+# Klee's builder validates the resulting vermagic before publishing images.
+KLEE_KERNEL_RELEASE_SUFFIX ?= -klee
 KLEE_KERNEL_DT_LAYOUT := $(strip $(KLEE_KERNEL_DT_LAYOUT))
 KLEE_KERNEL_BUNDLE_STAMP ?= $(KLEE_KERNEL_DIST)/.klee-kernel-bundle.stamp
 
