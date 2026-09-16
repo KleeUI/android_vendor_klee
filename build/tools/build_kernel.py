@@ -1164,7 +1164,11 @@ def configure_cupid_source_module_configs(args, platform, platform_env):
         "USB_NET_AX88179_178A",
         "REGULATOR_FAN53555",
     )
+    # Keep the two Klee-owned platform options from configs/klee_GKI.config
+    # active when Qualcomm's production Waipio fragment is selected.
     config_args = " ".join(f"-m {symbol}" for symbol in symbols)
+    config_args += " -y QCOM_DMABUF_HEAPS_SYSTEM_UNCACHED"
+    config_args += " -y FW_LOADER_USER_HELPER_FALLBACK"
     helper.write_text(
         "#!/bin/bash\n"
         "set -euo pipefail\n"
@@ -2880,6 +2884,18 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     platform_env["BUILD_CONFIG"] = build_config.as_posix()
     platform_env["OUT_DIR"] = str(args.out)
     platform_env["DIST_DIR"] = str(args.dist)
+    # build.sh consumes VARIANT while sourcing build.config.*. Passing it
+    # only as a positional make argument is too late: build.config.msm.waipio
+    # has already defaulted to the debug consolidate variant by then. Export
+    # the explicit variant before invoking build.sh so Klee's production GKI
+    # selection is deterministic and auditable.
+    for make_arg in args.make_arg:
+        text = str(make_arg)
+        if text.startswith("VARIANT="):
+            variant = text.split("=", 1)[1]
+            if not re.fullmatch(r"[A-Za-z0-9_.+-]+", variant):
+                raise ValueError("invalid kernel VARIANT: " + repr(variant))
+            platform_env["VARIANT"] = variant
     ordered_external_modules = order_external_modules(args.external_module)
     for inherited in (
         "EXT_MODULES",
