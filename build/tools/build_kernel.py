@@ -7,6 +7,7 @@
 """Build and verify a Klee kernel bundle inside an Android checkout."""
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -30,6 +32,15 @@ KLEE_EXCLUSIVE_KERNEL_MODULE_GROUPS = {
         ("sync_fence.ko", "qcom_sync_file.ko")
     ),
 }
+
+# A mixed build links the boot Image from ``common`` and the vendor modules
+# from ``msm-kernel``.  Linux compares the complete module vermagic against
+# the Image's UTS_RELEASE before it will load a module; allowing each source
+# tree to append its own SCM revision therefore produces a package that can
+# compile successfully but cannot boot.  Keep one explicit, reproducible
+# suffix for both trees and validate the result before publishing the bundle.
+KLEE_DEFAULT_KERNEL_RELEASE_SUFFIX = "-klee"
+KLEE_KERNEL_RELEASE_SUFFIX_RE = re.compile(r"^-[A-Za-z0-9][A-Za-z0-9+_.-]*$")
 
 
 def parse_args():
@@ -86,6 +97,193 @@ def validate_exclusive_kernel_modules(args):
 def run(command, env, cwd=None):
     print("+", " ".join(str(item) for item in command), flush=True)
     subprocess.run(command, cwd=cwd, env=env, check=True)
+
+
+def kernel_release_suffix():
+    """Return the release suffix used by both sides of a mixed build.
+
+    The value is deliberately an environment setting rather than a product
+    name baked into the kernel sources.  Device makefiles can select a
+    different, reviewable suffix while the default remains deterministic for
+    a clean Klee checkout.
+    """
+    suffix = os.environ.get(
+        "KLEE_KERNEL_RELEASE_SUFFIX", KLEE_DEFAULT_KERNEL_RELEASE_SUFFIX
+    )
+    if not KLEE_KERNEL_RELEASE_SUFFIX_RE.fullmatch(suffix):
+        raise ValueError(
+            "KLEE_KERNEL_RELEASE_SUFFIX must start with '-' and contain only "
+            "ASCII letters, digits, '+', '_', '.', or '-': "
+            + repr(suffix)
+        )
+    return suffix
+
+
+def _atomic_write(path, data, mode):
+    """Atomically replace *path* with bytes while retaining its mode."""
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.klee-", dir=str(path.parent)
+    )
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+@contextlib.contextmanager
+def temporary_mixed_kernel_release(platform, source):
+    """Pin common and vendor SCM suffixes for one mixed-kernel transaction.
+
+    ``scripts/setlocalversion`` intentionally reads a source-tree
+    ``.scmversion`` file before consulting git.  The file is ignored by both
+    Qualcomm trees, so creating it for the duration of ``build.sh`` gives the
+    nested GKI build and the outer vendor-module build exactly the same
+    UTS_RELEASE without changing tracked source or the generated configs.
+    Any pre-existing file is restored byte-for-byte, including its mode, on
+    every success and failure path.
+    """
+    suffix = kernel_release_suffix()
+    roots = []
+    for candidate in (source, platform / "common"):
+        root = candidate.resolve()
+        if root not in roots:
+            roots.append(root)
+    if not roots or any(not root.is_dir() for root in roots):
+        missing = [str(root) for root in roots if not root.is_dir()]
+        raise FileNotFoundError(
+            "mixed kernel source tree is missing: " + ", ".join(missing)
+        )
+
+    backups = []
+    try:
+        for root in roots:
+            path = root / ".scmversion"
+            if path.is_symlink():
+                raise RuntimeError(
+                    "refusing to replace symlinked kernel .scmversion: "
+                    + str(path)
+                )
+            existed = path.exists()
+            if existed and not path.is_file():
+                raise RuntimeError(
+                    "kernel .scmversion is not a regular file: " + str(path)
+                )
+            old_data = path.read_bytes() if existed else None
+            old_mode = stat.S_IMODE(path.stat().st_mode) if existed else 0o644
+            backups.append((path, existed, old_data, old_mode))
+            _atomic_write(path, (suffix + "\n").encode("ascii"), old_mode)
+        print(
+            "Klee mixed-kernel release suffix pinned to "
+            f"{suffix} for {len(roots)} source trees",
+            flush=True,
+        )
+        yield suffix
+    finally:
+        restore_error = None
+        for path, existed, old_data, old_mode in reversed(backups):
+            try:
+                if existed:
+                    _atomic_write(path, old_data, old_mode)
+                elif path.is_symlink() or path.is_file():
+                    path.unlink()
+                elif path.exists():
+                    raise RuntimeError(
+                        "kernel .scmversion became a non-file during build: "
+                        + str(path)
+                    )
+            except Exception as error:  # pragma: no cover - cleanup guard
+                if restore_error is None:
+                    restore_error = error
+        if restore_error is not None:
+            raise restore_error
+
+
+def _read_kernel_release(path, context):
+    """Read and sanity-check a generated kernel.release file."""
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{context} is missing: {path}") from error
+    if not value or any(character.isspace() for character in value):
+        raise RuntimeError(f"{context} is invalid: {path}")
+    return value
+
+
+def _module_vermagic(path):
+    """Extract the NUL-terminated vermagic string from an ELF .ko."""
+    marker = b"vermagic="
+    data = path.read_bytes()
+    start = data.find(marker)
+    if start < 0:
+        raise RuntimeError("kernel module has no vermagic metadata: " + str(path))
+    end = data.find(b"\0", start)
+    if end < 0:
+        raise RuntimeError("kernel module vermagic is unterminated: " + str(path))
+    try:
+        return data[start + len(marker) : end].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise RuntimeError("kernel module vermagic is not ASCII: " + str(path)) from error
+
+
+def validate_mixed_kernel_release(args, platform, platform_env, kernel_output):
+    """Verify that the Image and every staged module share one vermagic.
+
+    The platform builder emits the GKI output under ``gki_kernel`` by
+    default.  Honour an explicit ``GKI_OUT_DIR`` as build.sh does, while
+    keeping the check independent of host ``modinfo`` availability.
+    """
+    gki_out_value = platform_env.get("GKI_OUT_DIR")
+    if gki_out_value:
+        gki_out = pathlib.Path(gki_out_value)
+        if not gki_out.is_absolute():
+            gki_out = platform / gki_out
+    else:
+        gki_out = args.out / "gki_kernel"
+    gki_release_path = gki_out / "common" / "include" / "config" / "kernel.release"
+    vendor_release_path = kernel_output / "include" / "config" / "kernel.release"
+    gki_release = _read_kernel_release(gki_release_path, "GKI kernel.release")
+    vendor_release = _read_kernel_release(
+        vendor_release_path, "vendor kernel.release"
+    )
+    if gki_release != vendor_release:
+        raise RuntimeError(
+            "mixed kernel release mismatch: "
+            f"GKI={gki_release!r} ({gki_release_path}), "
+            f"vendor={vendor_release!r} ({vendor_release_path})"
+        )
+
+    staging = args.dist / "modules"
+    modules = sorted(staging.glob("*.ko")) if staging.is_dir() else []
+    magic_values = {}
+    for module in modules:
+        magic = _module_vermagic(module)
+        module_release = magic.split(" ", 1)[0]
+        if module_release != gki_release:
+            raise RuntimeError(
+                "kernel module vermagic does not match GKI release: "
+                f"{module} has {magic!r}, expected release {gki_release!r}"
+            )
+        magic_values.setdefault(magic, []).append(module.name)
+    if len(magic_values) > 1:
+        descriptions = "; ".join(
+            f"{magic!r}: {', '.join(names)}"
+            for magic, names in sorted(magic_values.items())
+        )
+        raise RuntimeError(
+            "kernel modules disagree on vermagic feature flags: " + descriptions
+        )
+    print(
+        "Klee mixed-kernel release validated: "
+        f"{gki_release} ({len(modules)} staged modules)",
+        flush=True,
+    )
 
 
 def inherited_kernel_path(top, value):
@@ -2673,11 +2871,15 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
         for value in args.make_arg
         if not str(value).startswith("KBUILD_EXTRA_SYMBOLS=")
     ]
-    run(
-        [str(build_script), f"-j{jobs}", *platform_make_args],
-        platform_env,
-        cwd=platform,
-    )
+    # build.sh recursively builds the GKI tree before compiling the vendor
+    # modules.  Pin both source trees for the complete invocation so neither
+    # side appends its independent git revision to UTS_RELEASE.
+    with temporary_mixed_kernel_release(platform, args.source):
+        run(
+            [str(build_script), f"-j{jobs}", *platform_make_args],
+            platform_env,
+            cwd=platform,
+        )
 
     required = [
         args.dist / args.image,
@@ -2696,6 +2898,9 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     # post-build Kbuild here: that would bypass the transaction symbol set and
     # would leave vendor_dlkm out of sync with the modules it publishes.
     stage_kernel_modules(args.dist)
+    validate_mixed_kernel_release(
+        args, platform, platform_env, args.out / args.source.relative_to(platform)
+    )
     if args.dt_layout:
         package_dt_layout(
             args,
