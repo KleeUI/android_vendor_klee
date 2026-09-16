@@ -205,6 +205,79 @@ def temporary_mixed_kernel_release(platform, source):
             raise restore_error
 
 
+def _module_list_target(build_config, make_args):
+    """Resolve the Qualcomm ``modules.list.<CONFIG_TARGET>`` selector."""
+    for value in make_args:
+        value = str(value)
+        if value.startswith("CONFIG_TARGET="):
+            target = value.split("=", 1)[1].strip()
+            if target:
+                return target
+    name = pathlib.Path(build_config).name
+    prefix = "build.config."
+    if name.startswith(prefix):
+        return name[len(prefix):]
+    return None
+
+
+def _deduplicate_module_list(data):
+    """Remove repeated module entries while preserving first-seen order."""
+    seen = set()
+    duplicates = []
+    output = []
+    for line in data.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(b"#"):
+            output.append(line)
+            continue
+        name = stripped.split(None, 1)[0]
+        if name in seen:
+            duplicates.append(name.decode("utf-8", "replace"))
+            continue
+        seen.add(name)
+        output.append(line)
+    return b"".join(output), duplicates
+
+
+@contextlib.contextmanager
+def temporary_deduplicated_kernel_module_lists(source, build_config, make_args):
+    """Deduplicate the active Qualcomm module list for one build transaction.
+
+    Some imported Qualcomm lists contain the same early-boot module more than
+    once.  ``build.sh`` copies that list verbatim into ``vendor_boot`` and a
+    duplicate there is both misleading and order-sensitive.  Keep the
+    imported source tree byte-for-byte unchanged after the transaction: only
+    the list selected by ``CONFIG_TARGET`` is temporarily normalized.
+    """
+    target = _module_list_target(build_config, make_args)
+    if not target:
+        yield
+        return
+    path = source.resolve() / f"modules.list.{target}"
+    if not path.is_file():
+        yield
+        return
+
+    original = path.read_bytes()
+    mode = stat.S_IMODE(path.stat().st_mode)
+    normalized, duplicates = _deduplicate_module_list(original)
+    if not duplicates:
+        yield
+        return
+
+    _atomic_write(path, normalized, mode)
+    print(
+        "Klee deduplicated "
+        f"{path.name}: removed {len(duplicates)} repeated entries "
+        f"({', '.join(sorted(set(duplicates)))})",
+        flush=True,
+    )
+    try:
+        yield
+    finally:
+        _atomic_write(path, original, mode)
+
+
 def _read_kernel_release(path, context):
     """Read and sanity-check a generated kernel.release file."""
     try:
@@ -1015,6 +1088,27 @@ def stage_kernel_modules(dist):
     (dist / "modules.list").write_text(
         "".join(f"{name}\n" for name in staged), encoding="utf-8"
     )
+
+
+def validate_unique_module_load_lists(dist):
+    """Reject duplicate entries in any published module-load manifest."""
+    for path in sorted(dist.rglob("*.modules.load")):
+        seen = set()
+        duplicates = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            name = line.strip()
+            if not name or name.startswith("#"):
+                continue
+            if name in seen:
+                duplicates.append(name)
+            else:
+                seen.add(name)
+        if duplicates:
+            relative = path.relative_to(dist)
+            repeated = ", ".join(sorted(set(duplicates)))
+            raise RuntimeError(
+                f"duplicate module entries in {relative}: {repeated}"
+            )
 
 
 def validate_exclusive_kernel_outputs(args, dist):
@@ -2874,7 +2968,9 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     # build.sh recursively builds the GKI tree before compiling the vendor
     # modules.  Pin both source trees for the complete invocation so neither
     # side appends its independent git revision to UTS_RELEASE.
-    with temporary_mixed_kernel_release(platform, args.source):
+    with temporary_deduplicated_kernel_module_lists(
+        args.source, build_config, platform_make_args
+    ), temporary_mixed_kernel_release(platform, args.source):
         run(
             [str(build_script), f"-j{jobs}", *platform_make_args],
             platform_env,
@@ -2898,6 +2994,7 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     # post-build Kbuild here: that would bypass the transaction symbol set and
     # would leave vendor_dlkm out of sync with the modules it publishes.
     stage_kernel_modules(args.dist)
+    validate_unique_module_load_lists(args.dist)
     validate_mixed_kernel_release(
         args, platform, platform_env, args.out / args.source.relative_to(platform)
     )
