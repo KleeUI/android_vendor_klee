@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import shlex
 import shutil
 import stat
@@ -66,6 +67,9 @@ def parse_args():
     parser.add_argument("--dtbo-max-size", type=lambda value: int(value, 0))
     parser.add_argument("--external-module-root", type=pathlib.Path)
     parser.add_argument("--external-module", action="append", default=[])
+    parser.add_argument(
+        "--kmi-symbol-list", action="append", default=[], type=pathlib.Path
+    )
     parser.add_argument("--required-module", action="append", default=[])
     parser.add_argument("--retained-provenance", type=pathlib.Path)
     parser.add_argument("--source-manifest", type=pathlib.Path)
@@ -96,7 +100,33 @@ def validate_exclusive_kernel_modules(args):
 
 def run(command, env, cwd=None):
     print("+", " ".join(str(item) for item in command), flush=True)
-    subprocess.run(command, cwd=cwd, env=env, check=True)
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        returncode = process.wait()
+    except BaseException:
+        # The source-tree transaction must not restore KMI inputs while a
+        # descendant make process can still consume them. Terminate and reap
+        # the complete build process group before exception unwinding starts.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        raise
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command)
 
 
 def kernel_release_suffix():
@@ -119,7 +149,7 @@ def kernel_release_suffix():
     return suffix
 
 
-def _atomic_write(path, data, mode):
+def _atomic_write(path, data, mode, timestamps=None):
     """Atomically replace *path* with bytes while retaining its mode."""
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.klee-", dir=str(path.parent)
@@ -132,6 +162,8 @@ def _atomic_write(path, data, mode):
             os.fsync(stream.fileno())
         os.chmod(temporary, mode)
         os.replace(temporary, path)
+        if timestamps is not None:
+            os.utime(path, ns=timestamps, follow_symlinks=False)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -175,9 +207,13 @@ def temporary_mixed_kernel_release(platform, source):
                 raise RuntimeError(
                     "kernel .scmversion is not a regular file: " + str(path)
                 )
+            old_stat = path.stat() if existed else None
             old_data = path.read_bytes() if existed else None
-            old_mode = stat.S_IMODE(path.stat().st_mode) if existed else 0o644
-            backups.append((path, existed, old_data, old_mode))
+            old_mode = stat.S_IMODE(old_stat.st_mode) if existed else 0o644
+            old_times = (
+                (old_stat.st_atime_ns, old_stat.st_mtime_ns) if existed else None
+            )
+            backups.append((path, existed, old_data, old_mode, old_times))
             _atomic_write(path, (suffix + "\n").encode("ascii"), old_mode)
         print(
             "Klee mixed-kernel release suffix pinned to "
@@ -187,10 +223,10 @@ def temporary_mixed_kernel_release(platform, source):
         yield suffix
     finally:
         restore_error = None
-        for path, existed, old_data, old_mode in reversed(backups):
+        for path, existed, old_data, old_mode, old_times in reversed(backups):
             try:
                 if existed:
-                    _atomic_write(path, old_data, old_mode)
+                    _atomic_write(path, old_data, old_mode, old_times)
                 elif path.is_symlink() or path.is_file():
                     path.unlink()
                 elif path.exists():
@@ -198,6 +234,191 @@ def temporary_mixed_kernel_release(platform, source):
                         "kernel .scmversion became a non-file during build: "
                         + str(path)
                     )
+            except Exception as error:  # pragma: no cover - cleanup guard
+                if restore_error is None:
+                    restore_error = error
+        if restore_error is not None:
+            raise restore_error
+
+
+class KernelBuildInterrupted(RuntimeError):
+    """Make termination signals unwind source-tree transactions cleanly."""
+
+
+@contextlib.contextmanager
+def cleanup_on_termination_signals():
+    """Turn common termination signals into an exception during a transaction."""
+    previous = {}
+    interrupted = []
+
+    def handle(signum, _frame):
+        # The first signal starts normal Python exception unwinding. Ignore a
+        # repeated signal until every byte-for-byte source restoration has
+        # completed; the original exception is re-raised immediately after it.
+        if interrupted:
+            return
+        interrupted.append(signum)
+        raise KernelBuildInterrupted(
+            f"kernel build interrupted by signal {signum}"
+        )
+
+    for name in ("SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, handle)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+KLEE_KMI_SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+KLEE_QCOM_KMI_SYMBOL_LIST = pathlib.PurePosixPath(
+    "android/abi_gki_aarch64_qcom"
+)
+
+
+def _kernel_symbol_sort_key(symbol):
+    """Match the leading-underscore-insensitive order of Android KMI lists."""
+    return (symbol.lstrip("_"), symbol)
+
+
+def _read_additional_kmi_symbols(paths):
+    symbols = []
+    origins = {}
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(
+                "KMI symbol input must be a regular, non-symlinked file: "
+                + str(path)
+            )
+        try:
+            lines = path.read_text(encoding="ascii").splitlines()
+        except UnicodeDecodeError as error:
+            raise ValueError(f"KMI symbol input is not ASCII: {path}") from error
+        for line_number, raw in enumerate(lines, 1):
+            value = raw.strip()
+            if not value or value.startswith("#"):
+                continue
+            if not KLEE_KMI_SYMBOL_RE.fullmatch(value):
+                raise ValueError(
+                    f"invalid KMI symbol at {path}:{line_number}: {value!r}"
+                )
+            if value in origins:
+                raise ValueError(
+                    f"duplicate KMI symbol {value!r} at {path}:{line_number}; "
+                    f"first declared at {origins[value]}"
+                )
+            origins[value] = f"{path}:{line_number}"
+            symbols.append(value)
+    return sorted(symbols, key=_kernel_symbol_sort_key)
+
+
+def _extend_kmi_symbol_list(data, symbols, path):
+    """Insert missing symbols without reformatting the imported ABI list."""
+    lines = data.splitlines(keepends=True)
+    records = []
+    existing = set()
+    newline = b"\r\n" if b"\r\n" in data else b"\n"
+    for index, line in enumerate(lines):
+        body = line.rstrip(b"\r\n")
+        stripped = body.strip()
+        try:
+            value = stripped.decode("ascii")
+        except UnicodeDecodeError:
+            continue
+        if not KLEE_KMI_SYMBOL_RE.fullmatch(value):
+            continue
+        prefix_length = len(body) - len(body.lstrip())
+        records.append((index, value, body[:prefix_length]))
+        existing.add(value)
+
+    missing = [value for value in symbols if value not in existing]
+    if not missing:
+        return data, []
+    if not records:
+        raise RuntimeError(f"KMI target has no symbol records: {path}")
+
+    for value in missing:
+        key = _kernel_symbol_sort_key(value)
+        insertion = None
+        indent = records[-1][2]
+        for index, current, current_indent in records:
+            if _kernel_symbol_sort_key(current) > key:
+                insertion = index
+                indent = current_indent
+                break
+        if insertion is None:
+            insertion = records[-1][0] + 1
+        lines.insert(insertion, indent + value.encode("ascii") + newline)
+        # Rebuild indices because each insertion shifts following records.
+        records = []
+        for index, line in enumerate(lines):
+            body = line.rstrip(b"\r\n")
+            stripped = body.strip()
+            try:
+                current = stripped.decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            if KLEE_KMI_SYMBOL_RE.fullmatch(current):
+                prefix_length = len(body) - len(body.lstrip())
+                records.append((index, current, body[:prefix_length]))
+    return b"".join(lines), missing
+
+
+@contextlib.contextmanager
+def temporary_extended_kmi_symbol_lists(platform, source, inputs):
+    """Extend both halves of a mixed Qualcomm KMI transaction temporarily.
+
+    Device-owned inputs declare only the extra ABI names. The imported common
+    and msm-kernel repositories remain byte-for-byte clean after every success,
+    exception, or handled termination signal.
+    """
+    if not inputs:
+        yield
+        return
+    symbols = _read_additional_kmi_symbols(inputs)
+    if not symbols:
+        raise ValueError("KMI symbol inputs do not declare any symbols")
+
+    targets = []
+    for root in (source.resolve(), (platform / "common").resolve()):
+        path = root.joinpath(*KLEE_QCOM_KMI_SYMBOL_LIST.parts)
+        if path not in targets:
+            targets.append(path)
+
+    backups = []
+    try:
+        for path in targets:
+            if path.is_symlink() or not path.is_file():
+                raise FileNotFoundError(
+                    "Qualcomm KMI target must be a regular, non-symlinked file: "
+                    + str(path)
+                )
+            original_stat = path.stat()
+            original = path.read_bytes()
+            mode = stat.S_IMODE(original_stat.st_mode)
+            times = (original_stat.st_atime_ns, original_stat.st_mtime_ns)
+            updated, added = _extend_kmi_symbol_list(original, symbols, path)
+            backups.append((path, original, mode, times, updated != original))
+            if updated != original:
+                _atomic_write(path, updated, mode)
+            print(
+                f"Klee KMI transaction: {path} exposes "
+                f"{len(symbols)} requested symbols ({len(added)} added)",
+                flush=True,
+            )
+        yield
+    finally:
+        restore_error = None
+        for path, original, mode, times, changed in reversed(backups):
+            if not changed:
+                continue
+            try:
+                _atomic_write(path, original, mode, times)
             except Exception as error:  # pragma: no cover - cleanup guard
                 if restore_error is None:
                     restore_error = error
@@ -258,8 +479,10 @@ def temporary_deduplicated_kernel_module_lists(source, build_config, make_args):
         yield
         return
 
+    original_stat = path.stat()
     original = path.read_bytes()
-    mode = stat.S_IMODE(path.stat().st_mode)
+    mode = stat.S_IMODE(original_stat.st_mode)
+    times = (original_stat.st_atime_ns, original_stat.st_mtime_ns)
     normalized, duplicates = _deduplicate_module_list(original)
     if not duplicates:
         yield
@@ -275,7 +498,7 @@ def temporary_deduplicated_kernel_module_lists(source, build_config, make_args):
     try:
         yield
     finally:
-        _atomic_write(path, original, mode)
+        _atomic_write(path, original, mode, times)
 
 
 def _read_kernel_release(path, context):
@@ -2745,6 +2968,31 @@ def acquire_build_locks(roots):
     return handles
 
 
+def acquire_source_tree_locks(roots):
+    """Serialize temporary source mutations without creating lock files."""
+    import fcntl
+
+    descriptors = []
+    try:
+        for root in sorted(set(roots), key=lambda path: str(path)):
+            root = root.resolve()
+            if not root.is_dir():
+                raise FileNotFoundError(f"kernel source lock root is missing: {root}")
+            descriptor = os.open(
+                root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            print(f"Waiting for Klee kernel source lock: {root}", flush=True)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            print(f"Acquired Klee kernel source lock: {root}", flush=True)
+            descriptors.append(descriptor)
+        return descriptors
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+
+
 def layout_artifact_paths(layout, dts_root):
     """Return every Kbuild object named by a layout after validating paths."""
     paths = []
@@ -2991,7 +3239,9 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     # build.sh recursively builds the GKI tree before compiling the vendor
     # modules.  Pin both source trees for the complete invocation so neither
     # side appends its independent git revision to UTS_RELEASE.
-    with temporary_deduplicated_kernel_module_lists(
+    with cleanup_on_termination_signals(), temporary_extended_kmi_symbol_lists(
+        platform, args.source, args.kmi_symbol_list
+    ), temporary_deduplicated_kernel_module_lists(
         args.source, build_config, platform_make_args
     ), temporary_mixed_kernel_release(platform, args.source):
         run(
@@ -3062,6 +3312,13 @@ def main():
         args.retained_provenance = args.retained_provenance.resolve()
     if args.source_manifest:
         args.source_manifest = args.source_manifest.resolve()
+    resolved_kmi_inputs = []
+    for path in args.kmi_symbol_list:
+        resolved = path.resolve()
+        if resolved != top and top not in resolved.parents:
+            raise ValueError("KMI symbol input is outside Android checkout: " + str(path))
+        resolved_kmi_inputs.append(resolved)
+    args.kmi_symbol_list = resolved_kmi_inputs
 
     if len(set(args.required_module)) != len(args.required_module):
         raise ValueError("required kernel module names must be unique")
@@ -3077,6 +3334,8 @@ def main():
         if not value or path.is_absolute() or ".." in path.parts:
             raise ValueError(f"invalid external kernel module path: {value}")
     validate_exclusive_kernel_modules(args)
+    if args.kmi_symbol_list and not args.platform_root:
+        raise ValueError("KMI symbol inputs require a kernel platform build")
     if args.dtbo_target:
         target = pathlib.PurePosixPath(args.dtbo_target)
         if target.name != args.dtbo_target or target.suffix != ".img":
@@ -3112,6 +3371,16 @@ def main():
     build_lock_handles = acquire_build_locks(output_roots)
     if not build_lock_handles:
         raise RuntimeError("failed to acquire Klee kernel output locks")
+    source_lock_descriptors = []
+    if args.platform_root:
+        # KMI and release transactions temporarily touch shared platform
+        # sources. Flock the existing directory inode so serialization leaves
+        # neither tracked nor untracked files in the Android checkout.
+        source_lock_descriptors = acquire_source_tree_locks(
+            [args.platform_root]
+        )
+        if not source_lock_descriptors:
+            raise RuntimeError("failed to acquire Klee kernel source lock")
     if args.stamp:
         # The stamp is the transaction marker. Once a builder invocation has
         # acquired exclusive ownership, no previous bundle may remain valid.

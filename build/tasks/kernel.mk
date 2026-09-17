@@ -58,6 +58,12 @@ KLEE_KERNEL_EXTERNAL_MODULE_INPUTS := \
 KLEE_KERNEL_SOURCE_INPUTS += $(KLEE_KERNEL_EXTERNAL_MODULE_INPUTS)
 endif
 
+# Device KMI extensions are tracked inputs and are applied transactionally by
+# the builder; imported common/msm kernel repositories remain unmodified.
+ifneq ($(strip $(TARGET_KERNEL_KMI_SYMBOL_LISTS)),)
+KLEE_KERNEL_SOURCE_INPUTS += $(TARGET_KERNEL_KMI_SYMBOL_LISTS)
+endif
+
 ifneq ($(KLEE_KERNEL_DT_LAYOUT),)
 KLEE_KERNEL_DT_TOOL_INPUTS := \
     $(call klee-kernel-tracked-inputs,kernel_platform/external/dtc) \
@@ -89,6 +95,11 @@ KLEE_KERNEL_BUILD_ARGUMENTS += \
     $(foreach config,$(TARGET_KERNEL_CONFIG),--config $(config)) \
     $(foreach config,$(TARGET_KERNEL_CONFIG_EXT),--config $(config)) \
     $(foreach flag,$(TARGET_KERNEL_ADDITIONAL_FLAGS),--make-arg $(flag))
+endif
+
+ifneq ($(strip $(TARGET_KERNEL_KMI_SYMBOL_LISTS)),)
+KLEE_KERNEL_BUILD_ARGUMENTS += \
+    $(foreach list,$(TARGET_KERNEL_KMI_SYMBOL_LISTS),--kmi-symbol-list $(list))
 endif
 
 ifneq ($(strip $(TARGET_KERNEL_EXT_MODULE_ROOT)),)
