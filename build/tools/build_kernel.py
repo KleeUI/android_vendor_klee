@@ -2884,11 +2884,11 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     platform_env["BUILD_CONFIG"] = build_config.as_posix()
     platform_env["OUT_DIR"] = str(args.out)
     platform_env["DIST_DIR"] = str(args.dist)
-    # build.sh consumes VARIANT while sourcing build.config.*. Passing it
-    # only as a positional make argument is too late: build.config.msm.waipio
-    # has already defaulted to the debug consolidate variant by then. Export
-    # the explicit variant before invoking build.sh so Klee's production GKI
-    # selection is deterministic and auditable.
+    # build.sh consumes VARIANT while sourcing build.config.* and forwards
+    # GKI_* environment values into the nested common-kernel build. Passing
+    # either value only as a positional make argument is too late. Export the
+    # supported selectors before invoking build.sh so the production variant
+    # and mixed-kernel release are deterministic and auditable.
     for make_arg in args.make_arg:
         text = str(make_arg)
         if text.startswith("VARIANT="):
@@ -2896,6 +2896,13 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
             if not re.fullmatch(r"[A-Za-z0-9_.+-]+", variant):
                 raise ValueError("invalid kernel VARIANT: " + repr(variant))
             platform_env["VARIANT"] = variant
+        elif text.startswith("GKI_LOCALVERSION="):
+            localversion = text.split("=", 1)[1]
+            if not KLEE_KERNEL_RELEASE_SUFFIX_RE.fullmatch(localversion):
+                raise ValueError(
+                    "invalid GKI_LOCALVERSION: " + repr(localversion)
+                )
+            platform_env["GKI_LOCALVERSION"] = localversion
     ordered_external_modules = order_external_modules(args.external_module)
     for inherited in (
         "EXT_MODULES",
