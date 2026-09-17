@@ -41,6 +41,25 @@ def module_names(path: Path) -> set[str]:
     return names
 
 
+def excluded_module_names(manifest: dict, allowed: set[str]) -> set[str]:
+    """Return reviewed variant-only modules which must not survive staging."""
+
+    excluded: set[str] = set()
+    for value in manifest.get("exclude_modules", []):
+        name = str(value)
+        if not name.endswith(".ko") or Path(name).name != name:
+            raise SystemExit(f"invalid excluded kernel module basename: {name}")
+        excluded.add(name)
+
+    unknown = excluded - allowed
+    if unknown:
+        raise SystemExit(
+            "excluded kernel modules are absent from the source lists: "
+            + ", ".join(sorted(unknown))
+        )
+    return excluded
+
+
 def prune_directory(path: Path, allowed: set[str]) -> tuple[int, int]:
     if not path.is_dir():
         return 0, 0
@@ -98,6 +117,11 @@ def main() -> int:
     if not allowed:
         raise SystemExit("kernel module staging allowlist is empty")
 
+    excluded = excluded_module_names(manifest, allowed)
+    allowed.difference_update(excluded)
+    if not allowed:
+        raise SystemExit("kernel module staging allowlist is empty after exclusions")
+
     removed_modules = 0
     removed_metadata = 0
     visited = 0
@@ -116,7 +140,7 @@ def main() -> int:
 
     print(
         "KLEE_KERNEL_STAGING_PRUNE "
-        f"allowed={len(allowed)} visited={visited} "
+        f"allowed={len(allowed)} excluded={len(excluded)} visited={visited} "
         f"removed_modules={removed_modules} removed_metadata={removed_metadata} "
         f"invalidated={','.join(invalidated) if invalidated else 'none'}",
         flush=True,
