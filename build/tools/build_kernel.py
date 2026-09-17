@@ -117,12 +117,22 @@ def run(command, env, cwd=None):
         except ProcessLookupError:
             pass
         try:
-            process.wait(timeout=15)
+            process.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            pass
+        # A shell may exit on SIGTERM before a descendant which ignored it.
+        # Probe the original process group even after reaping the leader and
+        # kill every survivor before source transaction cleanup can proceed.
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+        if process.poll() is None:
             process.wait()
         raise
     if returncode:
@@ -245,34 +255,65 @@ class KernelBuildInterrupted(RuntimeError):
     """Make termination signals unwind source-tree transactions cleanly."""
 
 
-@contextlib.contextmanager
-def cleanup_on_termination_signals():
-    """Turn common termination signals into an exception during a transaction."""
-    previous = {}
-    interrupted = []
+class TerminationSignalGuard:
+    """Defer signals while source inputs are being changed or restored."""
 
-    def handle(signum, _frame):
-        # The first signal starts normal Python exception unwinding. Ignore a
-        # repeated signal until every byte-for-byte source restoration has
-        # completed; the original exception is re-raised immediately after it.
-        if interrupted:
-            return
-        interrupted.append(signum)
-        raise KernelBuildInterrupted(
-            f"kernel build interrupted by signal {signum}"
-        )
+    def __init__(self):
+        self._previous = {}
+        self._pending = None
+        self._armed = False
+        self._delivered = False
 
-    for name in ("SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"):
-        signum = getattr(signal, name, None)
-        if signum is None:
-            continue
-        previous[signum] = signal.getsignal(signum)
-        signal.signal(signum, handle)
-    try:
-        yield
-    finally:
-        for signum, handler in previous.items():
+    def _handle(self, signum, _frame):
+        if self._pending is None:
+            self._pending = signum
+        if self._armed and not self._delivered:
+            self._delivered = True
+            raise KernelBuildInterrupted(
+                f"kernel build interrupted by signal {self._pending}"
+            )
+
+    def __enter__(self):
+        for name in ("SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM"):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            self._previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._handle)
+        return self
+
+    def arm(self):
+        """Deliver signals immediately while descendant build jobs run."""
+        self._armed = True
+        if self._pending is not None and not self._delivered:
+            self._delivered = True
+            raise KernelBuildInterrupted(
+                f"kernel build interrupted by signal {self._pending}"
+            )
+
+    def defer(self):
+        """Record signals without interrupting a source restoration write."""
+        self._armed = False
+
+    def __exit__(self, exception_type, _exception, _traceback):
+        self._armed = False
+        for signum, handler in self._previous.items():
             signal.signal(signum, handler)
+        if (
+            self._pending is not None
+            and not self._delivered
+            and exception_type is None
+        ):
+            self._delivered = True
+            raise KernelBuildInterrupted(
+                f"kernel build interrupted by signal {self._pending}"
+            )
+        return False
+
+
+def cleanup_on_termination_signals():
+    """Return a guard for one source-mutating kernel transaction."""
+    return TerminationSignalGuard()
 
 
 KLEE_KMI_SYMBOL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -3239,16 +3280,20 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
     # build.sh recursively builds the GKI tree before compiling the vendor
     # modules.  Pin both source trees for the complete invocation so neither
     # side appends its independent git revision to UTS_RELEASE.
-    with cleanup_on_termination_signals(), temporary_extended_kmi_symbol_lists(
+    with cleanup_on_termination_signals() as termination_signals, temporary_extended_kmi_symbol_lists(
         platform, args.source, args.kmi_symbol_list
     ), temporary_deduplicated_kernel_module_lists(
         args.source, build_config, platform_make_args
     ), temporary_mixed_kernel_release(platform, args.source):
-        run(
-            [str(build_script), f"-j{jobs}", *platform_make_args],
-            platform_env,
-            cwd=platform,
-        )
+        try:
+            termination_signals.arm()
+            run(
+                [str(build_script), f"-j{jobs}", *platform_make_args],
+                platform_env,
+                cwd=platform,
+            )
+        finally:
+            termination_signals.defer()
 
     required = [
         args.dist / args.image,
