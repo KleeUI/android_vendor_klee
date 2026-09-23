@@ -569,6 +569,91 @@ def _module_vermagic(path):
         raise RuntimeError("kernel module vermagic is not ASCII: " + str(path)) from error
 
 
+def validate_module_linkage(modules, kernel_symvers, release, env):
+    """Reject duplicate runtime exports, missing providers and bad CRCs."""
+    if not modules:
+        raise RuntimeError("cannot validate an empty kernel module bundle")
+    if pathlib.PurePath(release).name != release or release in (".", ".."):
+        raise ValueError("invalid kernel release for module validation")
+    nm = shutil.which("llvm-nm", path=env.get("PATH"))
+    depmod = shutil.which("depmod", path=env.get("PATH"))
+    if not depmod:
+        # Android's restricted PATH can omit the host's administrative bins.
+        depmod = shutil.which("depmod", path="/usr/sbin:/sbin")
+    if not nm or not depmod:
+        raise RuntimeError("module ABI validation requires llvm-nm and depmod")
+
+    kernel_rows = []
+    providers = {}
+    for line in kernel_symvers.read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            raise ValueError("invalid kernel symbol table row: " + line)
+        # A GKI Module.symvers can also describe loadable modules which the
+        # product does not ship. Only vmlinux is an unconditional provider.
+        if fields[2] == "vmlinux":
+            kernel_rows.append(line)
+            providers[fields[1]] = "vmlinux"
+    if not kernel_rows:
+        raise RuntimeError("GKI symbol table contains no vmlinux exports")
+
+    duplicates = []
+    basenames = set()
+    for module in modules:
+        if module.name in basenames:
+            raise RuntimeError("duplicate module basename: " + module.name)
+        basenames.add(module.name)
+        symbols = subprocess.check_output(
+            [nm, "--defined-only", "-j", str(module)], env=env, text=True
+        )
+        for symbol in symbols.splitlines():
+            if not symbol.startswith("__ksymtab_"):
+                continue
+            name = symbol[len("__ksymtab_"):]
+            previous = providers.get(name)
+            if previous is not None:
+                duplicates.append(f"{name}: {previous}, {module.name}")
+            else:
+                providers[name] = module.name
+    if duplicates:
+        raise RuntimeError(
+            f"duplicate runtime symbol exports ({len(duplicates)}): "
+            + "; ".join(duplicates[:20])
+        )
+
+    with tempfile.TemporaryDirectory(prefix="klee-module-abi-") as temporary:
+        root = pathlib.Path(temporary)
+        staging = root / "lib" / "modules" / release
+        staging.mkdir(parents=True)
+        for module in modules:
+            (staging / module.name).symlink_to(module.resolve())
+        (staging / "modules.order").write_text(
+            "".join(module.name + "\n" for module in modules), encoding="utf-8"
+        )
+        for name in ("modules.builtin", "modules.builtin.modinfo"):
+            shutil.copy2(kernel_symvers.parent / name, staging / name)
+        symbols = root / "vmlinux.symvers"
+        symbols.write_text("\n".join(kernel_rows) + "\n", encoding="utf-8")
+        check_env = env.copy()
+        check_env["LC_ALL"] = "C"
+        result = subprocess.run(
+            [depmod, "-ae", "-E", str(symbols), "-b", str(root), release],
+            env=check_env, text=True, capture_output=True, check=False,
+        )
+        # depmod reports missing providers and CRC mismatches as warnings
+        # with exit status zero. They still prevent the kernel loading them.
+        if result.returncode or result.stderr.strip():
+            raise RuntimeError(
+                "kernel module dependency/CRC validation failed: "
+                + (result.stderr.strip() or result.stdout.strip()
+                   or f"depmod exit {result.returncode}")
+            )
+    print(
+        f"Klee module symbol ownership and CRCs validated: {len(modules)} modules",
+        flush=True,
+    )
+
+
 def validate_mixed_kernel_release(args, platform, platform_env, kernel_output):
     """Verify that the Image and every staged module share one vermagic.
 
@@ -616,6 +701,9 @@ def validate_mixed_kernel_release(args, platform, platform_env, kernel_output):
         raise RuntimeError(
             "kernel modules disagree on vermagic feature flags: " + descriptions
         )
+    validate_module_linkage(
+        modules, gki_out / "common" / "Module.symvers", gki_release, platform_env
+    )
     print(
         "Klee mixed-kernel release validated: "
         f"{gki_release} ({len(modules)} staged modules)",
