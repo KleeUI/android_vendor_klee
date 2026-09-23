@@ -3325,6 +3325,23 @@ def build_kernel_platform(args, top, make, jobs, env, layout, layout_digest):
         finally:
             termination_signals.defer()
 
+    # The mixed GKI build keeps the authoritative merged configuration in
+    # gki_kernel/common/.config.  Qualcomm build.sh does not copy that file
+    # into DIST_DIR when DIST_CMDS owns the external-module transaction, but
+    # KERNEL_KIT consumers require the public .config artifact there.
+    dist_config = args.dist / ".config"
+    if not dist_config.is_file():
+        config_candidates = (
+            args.out / "gki_kernel" / "common" / ".config",
+            args.out / "gki_kernel" / ".config",
+            args.out / ".config",
+            args.out / args.source.relative_to(platform) / ".config",
+        )
+        for config in config_candidates:
+            if config.is_file() and config.stat().st_size > 1024:
+                shutil.copy2(config, dist_config)
+                break
+
     required = [
         args.dist / args.image,
         args.dist / ".config",
