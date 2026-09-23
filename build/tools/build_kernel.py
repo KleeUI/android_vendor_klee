@@ -1131,6 +1131,13 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
             extras.append("CONFIG_MSM_CVP=m")
         elif module_name == "eva-kernel":
             extras.append("CONFIG_MSM_EVA=m")
+        elif relative == "dataipa/drivers/platform/msm":
+            # dataipa_GKI.conf enables ipatestm.ko by default, but the
+            # Cupid source module contract intentionally does not package
+            # the test provider.  Its legacy kfifo ABI is not exported by
+            # the Clang 21 GKI, so keep the external transaction limited to
+            # the runtime IPA providers named by the product manifest.
+            extras.append("CONFIG_IPA_KERNEL_TESTS_MODULE=")
 
         output_symvers = external_module_output_dir(args, relative, kernel_output)
         output_symvers.parent.mkdir(parents=True, exist_ok=True)
