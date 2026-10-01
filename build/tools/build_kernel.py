@@ -1538,6 +1538,9 @@ def configure_cupid_source_module_configs(args, platform, platform_env):
         "USB_NET_AX88179_178A",
         "REGULATOR_FAN53555",
     )
+    # Opt in only when the source-owned manifest selects the thermal module.
+    if "mi_thermal_interface.ko" in selected_kernel_module_names(args):
+        symbols += ("MI_THERMAL_INTERFACE",)
     # Keep the two Klee-owned platform options from configs/klee_GKI.config
     # active when Qualcomm's production Waipio fragment is selected.
     config_args = " ".join(f"-m {symbol}" for symbol in symbols)
