@@ -854,6 +854,7 @@ KLEE_EXTERNAL_MODULE_DEPENDENCIES = {
     "eva-kernel": ("mmrm-driver",),
     # qcacld consumes the current CNSS symbols (including WFC support) from
     # the tracked out-of-tree WLAN platform provider.
+    "wlan/platform": ("touch-drivers/xiaomi",),
     "wlan/qcacld-3.0": ("wlan/platform",),
     "dataipa/drivers/platform/msm": ("datarmnet-ext/mem",),
     "datarmnet/core": ("dataipa/drivers/platform/msm",),
@@ -875,6 +876,18 @@ def external_module_policy_key(relative):
         if value == key or value.endswith("/" + key):
             return key
     return value
+
+
+def xiaomi_cnss_make_args(module_root, modules, relative):
+    """Enable L3 filename selection only alongside the selected hwid provider."""
+    selected = {pathlib.PurePosixPath(value).as_posix() for value in modules}
+    if (pathlib.PurePosixPath(relative).as_posix() != "wlan/platform" or
+            "touch-drivers/xiaomi" not in selected):
+        return []
+    header_dir = module_root / "touch-drivers/xiaomi/drivers/misc/hwid"
+    if not (header_dir / "hwid.h").is_file():
+        raise RuntimeError("Selected Xiaomi hwid provider is missing its header")
+    return ["XIAOMI_HWID_ROOT=" + str(header_dir.resolve())]
 
 
 def order_external_modules(modules):
@@ -1214,7 +1227,7 @@ def write_platform_external_module_script(args, make, jobs, modules, kernel_outp
                 )
             continue
 
-        extras = []
+        extras = xiaomi_cnss_make_args(module_root, modules, relative)
         if module_name == "cvp-kernel":
             extras.append("CONFIG_MSM_CVP=m")
         elif module_name == "eva-kernel":
@@ -1373,6 +1386,8 @@ def install_external_modules(
             command.append("CONFIG_MSM_CVP=m")
         elif module_real.name == "eva-kernel":
             command.append("CONFIG_MSM_EVA=m")
+        command.extend(xiaomi_cnss_make_args(
+            args.external_module_root, modules, relative))
         # Every external module consumes the platform KMI and only the tables
         # published by an earlier step in this transaction.  Keep them in one
         # file because Qualcomm wrappers expand this variable again in a
