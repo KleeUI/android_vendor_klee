@@ -2018,8 +2018,20 @@ def validate_retained_provenance(path, top):
         seen.add(name)
 
 
+def prepared_source_tree(source, revision):
+    """Fingerprint tracked working-tree content without changing the real index."""
+    git = ["git", "-C", str(source)]
+    with tempfile.TemporaryDirectory(prefix="klee-source-index-") as directory:
+        env = dict(os.environ, GIT_INDEX_FILE=str(pathlib.Path(directory) / "index"))
+        for args in (("read-tree", revision), ("add", "--update", "--", ".")):
+            subprocess.check_output(git + list(args), env=env, stderr=subprocess.STDOUT)
+        return subprocess.check_output(
+            git + ["write-tree"], env=env, text=True, stderr=subprocess.STDOUT
+        ).strip()
+
+
 def validate_source_manifest(path, top, required_paths=()):
-    """Require every declared Qualcomm source project to be at its pin."""
+    """Require each Qualcomm project at its pin with the expected source tree."""
     if path is None:
         return
     path = path.resolve()
@@ -2039,6 +2051,7 @@ def validate_source_manifest(path, top, required_paths=()):
             raise TypeError("Qualcomm source manifest entries must be objects")
         relative = project.get("path")
         revision = project.get("revision")
+        prepared_tree = project.get("prepared_tree")
         if (
             not isinstance(relative, str)
             or not relative
@@ -2048,6 +2061,10 @@ def validate_source_manifest(path, top, required_paths=()):
             or relative in seen
             or not isinstance(revision, str)
             or not re.fullmatch(r"[0-9a-f]{40}", revision)
+            or ("prepared_tree" in project and (
+                not isinstance(prepared_tree, str)
+                or not re.fullmatch(r"[0-9a-f]{40}", prepared_tree)
+            ))
         ):
             raise ValueError(f"invalid Qualcomm source manifest entry: {project}")
         source = (top / pathlib.PurePosixPath(relative)).resolve()
@@ -2071,6 +2088,18 @@ def validate_source_manifest(path, top, required_paths=()):
                 f"Qualcomm source pin mismatch for {relative}: "
                 f"expected {revision}, got {actual}"
             )
+        if prepared_tree is not None:
+            try:
+                actual_tree = prepared_source_tree(source, revision)
+            except (OSError, subprocess.CalledProcessError) as error:
+                raise RuntimeError(f"cannot inspect prepared Qualcomm source tree: {source}") from error
+            if actual_tree != prepared_tree:
+                raise RuntimeError(
+                    f"Prepared Qualcomm source tree mismatch for {relative}: "
+                    f"expected {prepared_tree}, got {actual_tree}"
+                )
+            seen.add(relative)
+            continue
         try:
             dirty = subprocess.check_output(
                 [

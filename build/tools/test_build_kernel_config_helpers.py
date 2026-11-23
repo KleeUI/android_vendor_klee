@@ -131,5 +131,81 @@ class ConfigHookTests(unittest.TestCase):
         self.assertEqual(builder.absolute_lexical_path(self.alias), self.alias)
 
 
+@unittest.skipUnless(shutil.which("git"), "Source manifest tests require Git")
+class SourceManifestTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="klee-source-manifest-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.source = self.root / "qualcomm/overlay"
+        self.source.mkdir(parents=True)
+        self.tracked = self.source / "tracked.c"
+        self.tracked.write_bytes(b"upstream\n")
+        self.git("init", "--quiet", "--object-format=sha1")
+        self.git("config", "core.autocrlf", "false")
+        self.git("add", "--", "tracked.c")
+        self.git("commit", "--quiet", "-m", "upstream")
+        self.entry = {"path": "qualcomm/overlay", "revision": self.git("rev-parse", "HEAD")}
+        self.manifest = self.root / "source.json"
+
+    def git(self, *args):
+        return subprocess.check_output(
+            ["git", "-C", str(self.source), "-c", "user.name=Fixture", "-c",
+             "user.email=fixture@example.test", "-c", "commit.gpgsign=false", *args],
+            stderr=subprocess.STDOUT, text=True,
+        ).strip()
+
+    def prepare(self):
+        self.tracked.write_bytes(b"prepared\n")
+        self.git("add", "--", "tracked.c")
+        self.entry["prepared_tree"] = self.git("write-tree")
+        self.git("reset", "--quiet", "HEAD", "--", "tracked.c")
+
+    def validate(self):
+        self.manifest.write_text(json.dumps({"version": 1, "projects": [self.entry]}), encoding="utf-8")
+        builder.validate_source_manifest(self.manifest, self.root, [self.tracked])
+
+    def test_default_requires_clean_tracked_source(self):
+        (self.source / "untracked.txt").write_bytes(b"local alias\n")
+        self.validate()
+        self.tracked.write_bytes(b"modified\n")
+        with self.assertRaisesRegex(RuntimeError, "source project is dirty"):
+            self.validate()
+
+    def test_prepared_uses_working_tree_and_preserves_real_index(self):
+        self.prepare()
+        self.tracked.write_bytes(b"staged alternative\n")
+        self.git("add", "--", "tracked.c")
+        self.tracked.write_bytes(b"prepared\n")
+        (self.source / "untracked.txt").write_bytes(b"local alias\n")
+        index = self.source / ".git/index"
+        before = index.read_bytes()
+        self.validate()
+        self.assertEqual(index.read_bytes(), before)
+        self.assertEqual(self.git("show", ":tracked.c"), "staged alternative")
+
+    def test_prepared_mismatch_rejects_missing_patch_and_drift(self):
+        self.prepare()
+        for content in (b"upstream\n", b"unexpected change\n"):
+            with self.subTest(content=content):
+                self.tracked.write_bytes(content)
+                with self.assertRaisesRegex(RuntimeError, "Prepared Qualcomm source tree mismatch"):
+                    self.validate()
+
+    def test_prepared_does_not_bypass_revision_pin(self):
+        self.prepare()
+        self.git("add", "--", "tracked.c")
+        self.git("commit", "--quiet", "-m", "different pinned revision")
+        with self.assertRaisesRegex(RuntimeError, "Qualcomm source pin mismatch"):
+            self.validate()
+
+    def test_invalid_prepared_tree_is_rejected(self):
+        for value in (None, "", "A" * 40, "a" * 39):
+            with self.subTest(value=value):
+                self.entry["prepared_tree"] = value
+                with self.assertRaisesRegex(ValueError, "invalid Qualcomm source manifest entry"):
+                    self.validate()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
