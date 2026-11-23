@@ -1525,7 +1525,9 @@ def configure_cupid_source_module_configs(args, platform, platform_env):
     outer msm-kernel output; the nested GKI output has a different OUT_DIR and
     must retain its upstream config.
     """
-    expected_out = args.out / args.source.relative_to(platform)
+    # OUT_DIR is canonicalized by build.sh. Compare filesystem identities here
+    # while retaining the lexical output alias in args for the Android graph.
+    expected_out = (args.out / args.source.relative_to(platform)).resolve()
     helper = args.out / ".klee-enable-cupid-source-modules.sh"
     symbols = (
         "MTD",
@@ -1603,10 +1605,11 @@ def configure_external_spec_sync_provider(args, platform, platform_env):
     # exits for the nested GKI output, leaving only the outer msm-kernel
     # provider disabled.
     helper = args.out / ".klee-disable-legacy-cnss.sh"
+    expected_out = (args.out / args.source.relative_to(platform)).resolve()
     helper.write_text(
         "#!/bin/bash\n"
         "set -euo pipefail\n"
-        f"expected_out={shlex.quote(str(args.out / args.source.relative_to(args.platform_root)))}\n"
+        f"expected_out={shlex.quote(str(expected_out))}\n"
         f"kernel_source={shlex.quote(str(args.source))}\n"
         "current_out=\"$(readlink -m \"${OUT_DIR:-/nonexistent}\")\"\n"
         "if [ \"$current_out\" != \"$expected_out\" ]; then exit 0; fi\n"
