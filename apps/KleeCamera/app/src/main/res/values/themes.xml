@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="camera_accent">#ffcc80</color>
+    <style name="CameraTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:colorAccent">@color/camera_accent</item>
+        <item name="android:alertDialogTheme">@style/CameraAlertDialogTheme</item>
+    </style>
+    <style name="CameraAlertDialogTheme" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">@color/camera_accent</item>
+    </style>
+</resources>

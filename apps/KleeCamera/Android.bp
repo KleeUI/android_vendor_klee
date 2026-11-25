@@ -1,0 +1,24 @@
+// Copyright (C) 2026 The KleeUI Project
+// SPDX-License-Identifier: Apache-2.0
+
+android_app {
+    name: "KleeCamera",
+    manifest: "app/src/main/AndroidManifest.xml",
+    srcs: ["app/src/main/java/**/*.java"],
+    resource_dirs: ["app/src/main/res"],
+    sdk_version: "current",
+    min_sdk_version: "30",
+    target_sdk_version: "34",
+    java_version: "11",
+    product_specific: true,
+    overrides: ["Camera2"],
+    required: ["klee-camera-sysconfig"],
+}
+
+prebuilt_etc {
+    name: "klee-camera-sysconfig",
+    src: "klee-camera-sysconfig.xml",
+    filename_from_src: true,
+    sub_dir: "sysconfig",
+    product_specific: true,
+}
