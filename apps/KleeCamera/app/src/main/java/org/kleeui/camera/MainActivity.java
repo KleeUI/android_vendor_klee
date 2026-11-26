@@ -60,7 +60,7 @@ import static org.kleeui.camera.CameraController.hasVideoAudio;
 import static org.kleeui.camera.CameraController.isVideo;
 
 /** The camera's view and operator controls. Camera sessions are owned by CameraController. */
-public final class MainActivity extends Activity implements CameraController.Listener {
+public class MainActivity extends Activity implements CameraController.Listener {
     private static final int BACKGROUND = 0xff121211;
     private static final int PANEL = 0xff23221f;
     private static final int OUTLINE = 0xff3e3c36;
@@ -82,6 +82,7 @@ public final class MainActivity extends Activity implements CameraController.Lis
         Mode.VIDEO, Mode.VIDEO_HIGH_FRAME_RATE, Mode.VIDEO_4K, Mode.VIDEO_4K_HIGH_FRAME_RATE
     };
 
+    private final boolean secureCamera;
     private CameraController camera;
     private TextureView preview;
     private RecordingPreview recordingPreview;
@@ -144,11 +145,25 @@ public final class MainActivity extends Activity implements CameraController.Lis
     private final ExecutorService thumbnails = Executors.newSingleThreadExecutor();
     private final Runnable clearNotice = () -> notice.setVisibility(View.GONE);
 
+    public MainActivity() {
+        this(false);
+    }
+
+    MainActivity(boolean secureCamera) {
+        this.secureCamera = secureCamera;
+    }
+
     @Override
     public void onCreate(Bundle state) {
         super.onCreate(state);
         String action = getIntent().getAction();
-        boolean imageCapture = MediaStore.ACTION_IMAGE_CAPTURE.equals(action);
+        boolean secureCapture = MediaStore.ACTION_IMAGE_CAPTURE_SECURE.equals(action);
+        boolean secureAction = secureCapture || MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA_SECURE.equals(action);
+        if (secureCamera != secureAction || (secureCamera && !hasCameraPermission())) {
+            finish();
+            return;
+        }
+        boolean imageCapture = secureCapture || MediaStore.ACTION_IMAGE_CAPTURE.equals(action);
         boolean videoCapture = MediaStore.ACTION_VIDEO_CAPTURE.equals(action);
         initialVideoPending = videoCapture || MediaStore.INTENT_ACTION_VIDEO_CAMERA.equals(action);
         if (imageCapture || videoCapture) {
@@ -168,15 +183,17 @@ public final class MainActivity extends Activity implements CameraController.Lis
         window.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
         getWindow().setAttributes(window);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        String recent = captureRequest == null ? getPreferences(MODE_PRIVATE).getString("recent", null) : null;
-        if (recent != null) {
-            lastCapture = Uri.parse(recent);
-            lastCaptureVideo = getPreferences(MODE_PRIVATE).getBoolean("recentVideo", false);
-        }
-        showGrid = getPreferences(MODE_PRIVATE).getBoolean("grid", false);
-        String preference = getPreferences(MODE_PRIVATE).getString("videoProfile", Mode.VIDEO.name());
-        for (Mode profile : VIDEO_PROFILES) {
-            if (profile.name().equals(preference)) preferredVideoMode = profile;
+        if (!secureCamera) {
+            String recent = captureRequest == null ? getPreferences(MODE_PRIVATE).getString("recent", null) : null;
+            if (recent != null) {
+                lastCapture = Uri.parse(recent);
+                lastCaptureVideo = getPreferences(MODE_PRIVATE).getBoolean("recentVideo", false);
+            }
+            showGrid = getPreferences(MODE_PRIVATE).getBoolean("grid", false);
+            String preference = getPreferences(MODE_PRIVATE).getString("videoProfile", Mode.VIDEO.name());
+            for (Mode profile : VIDEO_PROFILES) {
+                if (profile.name().equals(preference)) preferredVideoMode = profile;
+            }
         }
         createInterface();
         WindowInsetsController bars = getWindow().getInsetsController();
@@ -196,8 +213,10 @@ public final class MainActivity extends Activity implements CameraController.Lis
         if (isFinishing()) return;
         refreshAccent();
         resumed = true;
-        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+        if (hasCameraPermission()) {
             startCamera();
+        } else if (secureCamera) {
+            finish();
         } else if (!permissionRequested) {
             requestCameraPermission();
         }
@@ -206,7 +225,7 @@ public final class MainActivity extends Activity implements CameraController.Lis
     @Override
     public void onConfigurationChanged(Configuration configuration) {
         super.onConfigurationChanged(configuration);
-        refreshAccent();
+        if (!isFinishing()) refreshAccent();
     }
 
     private int resolveAccent() {
@@ -282,6 +301,10 @@ public final class MainActivity extends Activity implements CameraController.Lis
             pendingAudio = granted;
             recordAfterAudioPermission();
         }
+    }
+
+    private boolean hasCameraPermission() {
+        return checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED;
     }
 
     private void requestCameraPermission() {
@@ -374,8 +397,10 @@ public final class MainActivity extends Activity implements CameraController.Lis
 
         previewMessage = overlayLabel("点击授权相机", 14);
         previewMessage.setOnClickListener(view -> {
-            if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-                if (permissionRequested && !shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)) {
+            if (!hasCameraPermission()) {
+                if (secureCamera) {
+                    finish();
+                } else if (permissionRequested && !shouldShowRequestPermissionRationale(Manifest.permission.CAMERA)) {
                     Intent intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                             Uri.fromParts("package", getPackageName(), null));
                     startActivity(intent);
@@ -444,12 +469,17 @@ public final class MainActivity extends Activity implements CameraController.Lis
         controls.addView(footer, new LinearLayout.LayoutParams(-1, 0, 1));
         FrameLayout left = new FrameLayout(this);
         footer.addView(left, new LinearLayout.LayoutParams(0, -1, 1));
-        galleryButton = new FrameLayout(this);
-        galleryButton.setContentDescription("相册");
-        galleryButton.setFocusable(true);
-        galleryButton.setOnClickListener(view -> openGallery());
-        left.addView(galleryButton, inFrame(dp(49), dp(49), Gravity.CENTER, 0));
-        setGalleryIcon();
+        if (secureCamera) {
+            toolsButton.setVisibility(View.GONE);
+            optionsButton.setVisibility(View.GONE);
+        } else {
+            galleryButton = new FrameLayout(this);
+            galleryButton.setContentDescription("相册");
+            galleryButton.setFocusable(true);
+            galleryButton.setOnClickListener(view -> openGallery());
+            left.addView(galleryButton, inFrame(dp(49), dp(49), Gravity.CENTER, 0));
+            setGalleryIcon();
+        }
 
         shutterButton = new CaptureButton();
         shutterButton.setFocusable(true);
@@ -507,7 +537,7 @@ public final class MainActivity extends Activity implements CameraController.Lis
             }
             flipButton.setBackground(fullscreen ? pressable(VIDEO_CONTROL, VIDEO_CONTROL_BORDER, 26)
                     : pressable(PANEL, OUTLINE, 18));
-            styleGalleryButton();
+            if (galleryButton != null) styleGalleryButton();
             lensRow.setBackground(fullscreen ? shape(VIDEO_CONTROL, VIDEO_CONTROL_BORDER, 24, 1)
                     : shape(0xcc151412, 0x996a6457, 18, 1));
             requestLayout();
@@ -610,6 +640,7 @@ public final class MainActivity extends Activity implements CameraController.Lis
         modeRow.removeAllViews();
         TextView selected = null;
         for (Mode mode : MODES) {
+            if (secureCamera && mode != Mode.PHOTO) continue;
             if (captureRequest != null && mode != (captureRequest.video ? Mode.VIDEO : Mode.PHOTO)) continue;
             if (lens == null || !lens.supports(mode)) continue;
             boolean active = currentMode == mode || (mode == Mode.VIDEO && isVideoProfileMode(currentMode));
@@ -873,7 +904,7 @@ public final class MainActivity extends Activity implements CameraController.Lis
     }
 
     private boolean supportsBurst() {
-        return captureRequest == null && (currentMode == Mode.PHOTO || currentMode == Mode.PRO);
+        return !secureCamera && captureRequest == null && (currentMode == Mode.PHOTO || currentMode == Mode.PRO);
     }
 
     private void toggleTools() {
@@ -1032,7 +1063,7 @@ public final class MainActivity extends Activity implements CameraController.Lis
     }
 
     private void shutter() {
-        if (captureResultPending) return;
+        if (captureResultPending || (secureCamera && currentMode != Mode.PHOTO)) return;
         if (timer != null) {
             cancelPhotoSequence();
             return;
@@ -1177,6 +1208,10 @@ public final class MainActivity extends Activity implements CameraController.Lis
     public void onReady(Lens newLens, Mode mode) {
         runOnUiThread(() -> {
             if (!cameraStarted || !resumed) return;
+            if (secureCamera && mode != Mode.PHOTO) {
+                finish();
+                return;
+            }
             if (initialVideoPending) {
                 initialVideoPending = false;
                 if (newLens.supports(Mode.VIDEO)) {
@@ -1243,10 +1278,12 @@ public final class MainActivity extends Activity implements CameraController.Lis
                 }
                 return;
             }
-            lastCapture = uri;
-            lastCaptureVideo = video;
-            getPreferences(MODE_PRIVATE).edit().putString("recent", uri.toString()).putBoolean("recentVideo", video).apply();
-            setGalleryIcon();
+            if (!secureCamera) {
+                lastCapture = uri;
+                lastCaptureVideo = video;
+                getPreferences(MODE_PRIVATE).edit().putString("recent", uri.toString()).putBoolean("recentVideo", video).apply();
+                setGalleryIcon();
+            }
             if (resumed) {
                 if (video) showNotice("视频已保存");
                 else if (burstRemaining > 0) showNotice("连拍已保存 " + (burstCount - burstRemaining + 1) + " / " + burstCount + " 张");
@@ -1341,7 +1378,7 @@ public final class MainActivity extends Activity implements CameraController.Lis
         enable(optionsButton, !recording && capturesIdle);
         enable(videoSettingsButton, switchingEnabled && isVideoProfileMode(currentMode));
         enable(flipButton, switchingEnabled && hasOtherFacing());
-        enable(galleryButton, captureRequest == null && !recording && capturesIdle);
+        if (galleryButton != null) enable(galleryButton, captureRequest == null && !recording && capturesIdle);
         shutterButton.setEnabled(!captureResultPending && (recording || cancelable || (controlsReady && capturesIdle)));
         String shutterLabel = isVideo(currentMode) ? "开始录像" : "拍照";
         if (recording) shutterLabel = "停止录像";
