@@ -22,6 +22,10 @@ The device `BoardConfig.mk` may include the optional Klee board configuration:
 include vendor/klee/build/board/BoardConfigKlee.mk
 ```
 
+Cupid selects the `KleeCamera` module through `build/product/camera.mk`.
+The Waipio manifest syncs its source into `packages/apps/KleeCamera`.
+[Klee Camera source](https://github.com/KleeUI/android_packages_apps_KleeCamera)
+
 ## Inline GKI build
 
 Klee's kernel integration is implemented independently and builds a standard
