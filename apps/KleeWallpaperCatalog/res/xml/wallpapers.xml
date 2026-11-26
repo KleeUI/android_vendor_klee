@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2026 The KleeUI Project
+     SPDX-License-Identifier: Apache-2.0 -->
+<wallpapers>
+    <category id="klee_wallpapers" title="@string/catalog_name"
+        featured="autumn_lane" thumbnail="@drawable/autumn_lane_thumb">
+        <static-wallpaper id="autumn_lane" title="@string/autumn_lane"
+            src="@drawable/autumn_lane" thumbnail="@drawable/autumn_lane_thumb" />
+        <static-wallpaper id="rainbow_magic" title="@string/rainbow_magic"
+            src="@drawable/rainbow_magic" thumbnail="@drawable/rainbow_magic_thumb" />
+        <static-wallpaper id="garden_party" title="@string/garden_party"
+            src="@drawable/garden_party" thumbnail="@drawable/garden_party_thumb" />
+        <static-wallpaper id="clover_festival" title="@string/clover_festival"
+            src="@drawable/clover_festival" thumbnail="@drawable/clover_festival_thumb" />
+        <static-wallpaper id="starry_flight" title="@string/starry_flight"
+            src="@drawable/starry_flight" thumbnail="@drawable/starry_flight_thumb" />
+        <static-wallpaper id="bubble_sky" title="@string/bubble_sky"
+            src="@drawable/bubble_sky" thumbnail="@drawable/bubble_sky_thumb" />
+    </category>
+</wallpapers>

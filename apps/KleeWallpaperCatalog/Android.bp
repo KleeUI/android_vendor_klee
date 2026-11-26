@@ -1,0 +1,9 @@
+// Copyright (C) 2026 The KleeUI Project
+// SPDX-License-Identifier: Apache-2.0
+
+android_app {
+    name: "KleeWallpaperCatalog",
+    sdk_version: "current",
+    product_specific: true,
+    srcs: ["src/**/*.java"],
+}

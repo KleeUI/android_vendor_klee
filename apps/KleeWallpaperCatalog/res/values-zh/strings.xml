@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2026 The KleeUI Project
+     SPDX-License-Identifier: Apache-2.0 -->
+<resources>
+    <string name="catalog_name">可莉壁纸</string>
+    <string name="autumn_lane">秋日小巷</string>
+    <string name="rainbow_magic">虹彩魔法</string>
+    <string name="garden_party">花园派对</string>
+    <string name="clover_festival">四叶庆典</string>
+    <string name="starry_flight">星空飞行</string>
+    <string name="bubble_sky">晴空泡泡</string>
+</resources>

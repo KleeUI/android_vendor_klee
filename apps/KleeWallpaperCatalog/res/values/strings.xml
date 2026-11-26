@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2026 The KleeUI Project
+     SPDX-License-Identifier: Apache-2.0 -->
+<resources>
+    <string name="catalog_name">Klee Wallpapers</string>
+    <string name="autumn_lane">Autumn Lane</string>
+    <string name="rainbow_magic">Rainbow Magic</string>
+    <string name="garden_party">Garden Party</string>
+    <string name="clover_festival">Clover Festival</string>
+    <string name="starry_flight">Starry Flight</string>
+    <string name="bubble_sky">Bubble Sky</string>
+</resources>
