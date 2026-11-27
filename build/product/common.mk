@@ -9,6 +9,8 @@ KLEE_COMMON_PRODUCT_INCLUDED := true
 
 KLEE_BUILD := true
 
+PRODUCT_PACKAGES += KleeGallery
+
 PRODUCT_SOONG_NAMESPACES += \
     vendor/klee
 
