@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Copyright (C) 2026 The KleeUI Project
+     SPDX-License-Identifier: Apache-2.0 -->
+<resources>
+    <string name="config_defaultDialer" translatable="false">org.kleeui.phone</string>
+</resources>
